@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-OneConnect Data Download App - Phase 1
-Desktop GUI application to download graph data from StoreConnect Pulse
+OneConnect Data Downloader
+Desktop GUI: download + diagnostics + data cruncher (coming soon)
 For Microblock-Cases on Dollar General profile
 """
 
 import sys
+import re
 import json
-import os
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import requests
@@ -18,15 +18,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QLabel,
     QProgressBar, QMessageBox, QInputDialog, QSpinBox, QTabWidget,
-    QDialog, QLineEdit, QDialogButtonBox, QTextBrowser
+    QDialog, QLineEdit, QDialogButtonBox, QTextBrowser, QCheckBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
-try:
-    from PyQt5.QtWidgets import QApplication
-    _clipboard = QApplication.clipboard
-except:
-    _clipboard = None
 
 from diagnostics import DiagnosticsWidget
 
@@ -43,18 +38,28 @@ _APP_DIR = Path.home() / "OneC"
 DATA_DIR = _APP_DIR / "downloads"
 TOKEN_FILE = _APP_DIR / "token.txt"
 RTA_FILE = _APP_DIR / "rta.txt"
+CATALOG_FILE = DATA_DIR / "_catalog.json"
 
 # Microblock telemetry attributes
-# sensor-data = numeric (temperatures), sensor-event = boolean (status flags)
-CASE_STATUS_ATTRS = [
-    {"attribute": "Control Temperature", "serviceType": "Microblock-sensor-data"},
-    {"attribute": "Defrost Terminate",   "serviceType": "Microblock-sensor-data"},
-    {"attribute": "Defrost Status",      "serviceType": "Microblock-sensor-data"},
+# sensor-data = numeric (3 temp sensors + defrost status)
+# sensor-event = digital outputs + setpoint
+CASE_ATTRS = [
+    {"attribute": "Control Temperature",      "serviceType": "Microblock-sensor-data"},
+    {"attribute": "Defrost Terminate",         "serviceType": "Microblock-sensor-data"},
+    {"attribute": "Defrost Status",            "serviceType": "Microblock-sensor-data"},
     {"attribute": "Compressor Discharge Temp", "serviceType": "Microblock-sensor-data"},
-    {"attribute": "Alarm",               "serviceType": "Microblock-sensor-event"},
-    {"attribute": "Refrigeration DO",    "serviceType": "Microblock-sensor-event"},
-    {"attribute": "Setpoint",            "serviceType": "Microblock-sensor-event"},
-    {"attribute": "Evap Fan DO",         "serviceType": "Microblock-sensor-event"},
+    {"attribute": "Refrigeration DO",          "serviceType": "Microblock-sensor-event"},
+    {"attribute": "Setpoint",                  "serviceType": "Microblock-sensor-event"},
+    {"attribute": "Evap Fan DO",               "serviceType": "Microblock-sensor-event"},
+    {"attribute": "Cond Fan DO",               "serviceType": "Microblock-sensor-event"},
+    {"attribute": "Defrost DO",                "serviceType": "Microblock-sensor-event"},
+]
+
+# Store ambient sensor attributes
+STORE_ATTRS = [
+    {"attribute": "Temperature", "serviceType": "RHsensor-sensor-data"},
+    {"attribute": "Humidity",    "serviceType": "RHsensor-sensor-data"},
+    {"attribute": "Dewpoint",    "serviceType": "RHsensor-sensor-data"},
 ]
 
 
@@ -73,7 +78,7 @@ def refresh_token(rta: str) -> Optional[str]:
         if resp.status_code == 200:
             auth = resp.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
-                return auth[7:]  # strip "Bearer " prefix
+                return auth[7:]
             return auth
     except Exception:
         pass
@@ -85,6 +90,24 @@ def get_headers(token: str) -> dict:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
+
+# ---------------------------------------------------------------------------
+#  Catalog  (tracks all downloaded cases + metadata)
+# ---------------------------------------------------------------------------
+
+def load_catalog() -> dict:
+    if CATALOG_FILE.exists():
+        try:
+            return json.loads(CATALOG_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_catalog(catalog: dict):
+    CATALOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CATALOG_FILE.write_text(json.dumps(catalog, indent=2, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +126,6 @@ class TokenInputDialog(QDialog):
     def _build(self):
         layout = QVBoxLayout(self)
 
-        # Instructions
         instr = QLabel(
             "Your RTA token has expired. Get a fresh one:\n\n"
             "1. Go to: mc.us.oneconnect.net\n"
@@ -114,7 +136,6 @@ class TokenInputDialog(QDialog):
         instr.setStyleSheet("font-size:11px; line-height:1.6;")
         layout.addWidget(instr)
 
-        # Command box (highlighted, selectable, easy to copy)
         cmd_box = QTextEdit()
         cmd_box.setPlainText("localStorage.getItem('RTA')")
         cmd_box.setReadOnly(True)
@@ -125,7 +146,6 @@ class TokenInputDialog(QDialog):
         )
         layout.addWidget(cmd_box)
 
-        # Copy button
         btn_copy = QPushButton("Copy command to clipboard")
         btn_copy.setFixedHeight(32)
         btn_copy.setStyleSheet(
@@ -138,18 +158,16 @@ class TokenInputDialog(QDialog):
 
         layout.addSpacing(10)
 
-        # Paste result
         paste_label = QLabel("5. Paste the result here:")
         paste_label.setStyleSheet("font-size:11px; font-weight:bold;")
         layout.addWidget(paste_label)
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Paste your RTA token here (long string starting with 5c227...)")
-        self.input.setEchoMode(QLineEdit.Password)  # Hide for privacy
+        self.input.setPlaceholderText("Paste your RTA token here (looks like 5c227fcf-369b-...)")
+        self.input.setEchoMode(QLineEdit.Password)
         self.input.setMinimumHeight(40)
         layout.addWidget(self.input)
 
-        # Help text
         help_text = QLabel(
             "The token looks like:  5c227fcf-369b-451d-b5ad-537c4d745a32\n"
             "This only needs to be done once."
@@ -157,27 +175,21 @@ class TokenInputDialog(QDialog):
         help_text.setStyleSheet("font-size:10px; color:#888;")
         layout.addWidget(help_text)
 
-        # Dialog buttons
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
     def _copy_to_clipboard(self, text: str):
-        """Copy text to system clipboard."""
         try:
-            # Get clipboard from QApplication
             app = QApplication.instance()
             if app:
-                cb = app.clipboard()
-                cb.setText(text)
-                # Visual feedback
-                self.input.setPlaceholderText("✓ Command copied to clipboard — paste it in the browser console")
+                app.clipboard().setText(text)
+                self.input.setPlaceholderText("Command copied! Paste it in the browser console")
         except Exception:
             pass
 
     def _accept(self):
-        """Validate and accept."""
         token = self.input.text().strip()
         if len(token) < 10:
             QMessageBox.warning(self, "Invalid", "Please paste the token from the browser console.")
@@ -191,22 +203,21 @@ class TokenInputDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class DownloadWorker(QObject):
-    """Worker thread for downloading data"""
-    progress = pyqtSignal(str)          # Status message
-    case_progress = pyqtSignal(int, int)  # current, total
-    step_progress = pyqtSignal(str)     # Current step description
-    finished = pyqtSignal(bool, str)    # success, summary
+    """Worker thread for downloading data with pagination and incremental updates."""
+    progress = pyqtSignal(str)
+    case_progress = pyqtSignal(int, int)
+    step_progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
 
-    def __init__(self, case_ids: List[str], token: str, rta: str, hours: int = 24):
+    def __init__(self, case_ids: List[str], token: str, rta: str, days: int = 90):
         super().__init__()
         self.case_ids = case_ids
         self.token = token
         self.rta = rta
-        self.hours = hours
+        self.days = days
 
     # ---- token refresh ----
     def _ensure_token(self):
-        """Auto-refresh the token. Raises if RTA is expired."""
         new = refresh_token(self.rta)
         if new:
             self.token = new
@@ -218,102 +229,256 @@ class DownloadWorker(QObject):
                 "RTA token has expired.\n\n"
                 "Get a new one from the browser:\n"
                 "  1. Open mc.us.oneconnect.net\n"
-                "  2. F12 → Console\n"
+                "  2. F12 > Console\n"
                 "  3. Run: localStorage.getItem('RTA')\n"
                 "  4. Click 'Update Token' in the app and paste it"
             )
 
+    # ---- token refresh mid-run (every ~12 minutes) ----
+    def _maybe_refresh_token(self):
+        """Re-refresh token to avoid expiry during long downloads."""
+        new = refresh_token(self.rta)
+        if new:
+            self.token = new
+            TOKEN_FILE.write_text(new)
+
     # ---- asset lookup ----
     def _find_asset(self, serial: str) -> Optional[dict]:
-        """Find asset by serial number. Returns {id, serialNumber, ...}."""
         url = f"{BASE_URL}/tenants/{TENANT_ID}/tenant-api/asset-optimizer/v1/assets"
         params = {"pageNumber": 0, "pageSize": 5, "search": serial}
         resp = requests.get(url, headers=get_headers(self.token), params=params, timeout=15)
         resp.raise_for_status()
-        data = resp.json().get("data", [])
-        for asset in data:
+        for asset in resp.json().get("data", []):
             if asset.get("serialNumber") == serial:
                 return asset
         return None
 
     # ---- module discovery ----
     def _get_modules(self, asset_id: int) -> List[dict]:
-        """Get module placeholders for an asset."""
         url = f"{BASE_URL}/tenants/{TENANT_ID}/tenant-api/asset-optimizer/v1/assets/{asset_id}"
         resp = requests.get(url, headers=get_headers(self.token), timeout=15)
         resp.raise_for_status()
         return resp.json().get("modulePlaceholders", [])
 
-    # ---- telemetry query ----
+    # ---- extract metadata from asset response ----
+    @staticmethod
+    def _extract_metadata(asset: dict) -> dict:
+        model = asset.get("model", {})
+        inv = asset.get("inventoryType", {})
+        subgroup = asset.get("subgroup", {})
+        group = asset.get("group", {})
+
+        sg_name = subgroup.get("name", "") if isinstance(subgroup, dict) else ""
+        parts = sg_name.split(" - ", 1)
+        store_num = parts[0].strip() if parts else ""
+        store_name = parts[1].strip() if len(parts) > 1 else ""
+
+        return {
+            "model": model.get("name", "") if isinstance(model, dict) else "",
+            "inventory_type": inv.get("name", "") if isinstance(inv, dict) else "",
+            "alt_name": asset.get("altName", ""),
+            "store": store_num,
+            "store_name": store_name,
+            "state": group.get("name", "") if isinstance(group, dict) else "",
+            "num_modules": asset.get("numberOfModules", 0),
+        }
+
+    # ---- paginated telemetry query ----
     def _query_telemetry(self, external_id: str, service_type: str,
-                         attrs: List[dict], hours: int) -> pd.DataFrame:
+                         attrs: List[dict],
+                         start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
         """
-        Query telemetry data for one module, one service type.
-        attrs: list of {"attribute": "Control Temperature", ...}
-        Returns DataFrame with timestamp + value columns.
+        Query telemetry with automatic pagination.
+        Pages through 2000-row chunks until all data is fetched.
         """
         url = f"{BASE_URL}/projects/{PROJECT_ID}/telemetry/v1/telemetry-attributes:query"
 
-        now = datetime.now(timezone.utc)
-        start = now - timedelta(hours=hours)
-
         agg_attrs = []
-        for a in attrs:
+        for i, a in enumerate(attrs):
             agg_attrs.append({
                 "attribute": a["attribute"],
-                "id": 0,
+                "id": i,
                 "name": a["attribute"],
                 "legend": f"{a['attribute']} - LTTB",
                 "aggregation": "LTTB",
             })
 
-        payload = {
-            "serviceType": service_type,
-            "aggregatedAttributes": agg_attrs,
-            "searchSpan": {
-                "from": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                "to":   now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            },
-            "timeSeriesId": {"assetExternalId": external_id},
-            "withStep": True,
-            "pageSize": 2000,
-        }
+        all_rows = []
+        page_from = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        page_num = 0
 
-        # event service type needs extra fields
-        if "event" in service_type:
-            payload["lookupBeforeStart"] = True
-            payload["sortDirection"] = "ASC"
+        while True:
+            payload = {
+                "serviceType": service_type,
+                "aggregatedAttributes": agg_attrs,
+                "searchSpan": {
+                    "from": page_from,
+                    "to":   end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                },
+                "timeSeriesId": {"assetExternalId": external_id},
+                "withStep": True,
+                "pageSize": 2000,
+            }
 
-        resp = requests.post(url, json=payload,
-                             headers=get_headers(self.token), timeout=30)
-        resp.raise_for_status()
-        rows = resp.json().get("data", [])
+            if "event" in service_type:
+                payload["lookupBeforeStart"] = True
+                payload["sortDirection"] = "ASC"
 
-        if not rows:
+            resp = requests.post(url, json=payload,
+                                 headers=get_headers(self.token), timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+            rows = result.get("data", [])
+            meta = result.get("meta", {})
+
+            all_rows.extend(rows)
+            page_num += 1
+
+            if meta.get("last", True) or not rows:
+                break
+
+            next_token = meta.get("nextPageToken")
+            if not next_token:
+                break
+            page_from = next_token
+            self.progress.emit(f"      ... page {page_num + 1} ({len(all_rows)} rows so far)")
+
+        if not all_rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(all_rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-            df = df.sort_values("timestamp")
+            df = df.sort_values("timestamp").drop_duplicates(
+                subset=["timestamp"]).reset_index(drop=True)
         return df
 
-    # ---- main loop ----
+    # ---- store ambient download ----
+    def _download_store_ambient(self, store_num: str,
+                                start_dt: datetime,
+                                end_dt: datetime) -> Optional[pd.DataFrame]:
+        """Find the DG{store} rhsensor and download ambient data."""
+        serial = f"DG{store_num}"
+        self.progress.emit(f"    Looking up store sensor {serial}...")
+
+        asset = self._find_asset(serial)
+        if not asset:
+            self.progress.emit(f"    -- No store ambient sensor found for {serial}")
+            return None
+
+        asset_id = asset["id"]
+
+        # Get module external IDs (rhsensor might have modules or not)
+        modules = self._get_modules(asset_id)
+
+        # Determine the external ID for telemetry query
+        ext_id = None
+        if modules:
+            ext_id = modules[0].get("externalId")
+        if not ext_id:
+            # Try using the asset serial as external ID
+            ext_id = serial
+
+        attrs = STORE_ATTRS
+        try:
+            df = self._query_telemetry(
+                ext_id, "RHsensor-sensor-data", attrs, start_dt, end_dt
+            )
+            if not df.empty:
+                self.progress.emit(f"    OK  {len(df)} rows of store ambient data")
+            else:
+                self.progress.emit(f"    -- No store ambient data returned")
+            return df if not df.empty else None
+        except Exception as e:
+            self.progress.emit(f"    -- Store ambient error: {e}")
+            return None
+
+    # ---- merge with existing data ----
+    @staticmethod
+    def _merge_sheets(existing_file: Path, new_sheets: dict) -> dict:
+        """Merge new data with existing Excel file, deduplicate by timestamp."""
+        try:
+            xl = pd.ExcelFile(existing_file)
+            for sheet_name in xl.sheet_names:
+                if sheet_name in new_sheets:
+                    old_df = pd.read_excel(xl, sheet_name=sheet_name)
+                    if "timestamp" in old_df.columns:
+                        old_df["timestamp"] = pd.to_datetime(old_df["timestamp"])
+                    new_df = new_sheets[sheet_name]
+                    merged = pd.concat([old_df, new_df], ignore_index=True)
+                    if "timestamp" in merged.columns:
+                        merged = merged.drop_duplicates(
+                            subset=["timestamp"]).sort_values(
+                            "timestamp").reset_index(drop=True)
+                    new_sheets[sheet_name] = merged
+                else:
+                    # Keep existing sheet that we didn't re-download
+                    old_df = pd.read_excel(xl, sheet_name=sheet_name)
+                    if "timestamp" in old_df.columns:
+                        old_df["timestamp"] = pd.to_datetime(old_df["timestamp"])
+                    new_sheets[sheet_name] = old_df
+        except Exception:
+            pass  # If existing file is corrupt, just use new data
+        return new_sheets
+
+    # ---- safe write ----
+    @staticmethod
+    def _safe_write_excel(file_path: Path, sheets: dict):
+        """Write to temp file, then rename. Protects against mid-write corruption."""
+        tmp = file_path.with_suffix(".tmp.xlsx")
+        with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
+            for sheet_name, df in sheets.items():
+                # Clean sheet name for Excel
+                clean = re.sub(r'[\\/*\[\]:?]', '-', sheet_name)[:31]
+                df.to_excel(writer, sheet_name=clean, index=False)
+
+        # Atomic-ish replace
+        if file_path.exists():
+            file_path.unlink()
+        tmp.rename(file_path)
+
+    # ---- main download loop ----
     def run(self):
         try:
-            # Refresh token at start
             self.step_progress.emit("Refreshing auth token...")
             self._ensure_token()
 
             DATA_DIR.mkdir(parents=True, exist_ok=True)
+            catalog = load_catalog()
             successful = []
             failed = []
+            now = datetime.now(timezone.utc)
 
             for idx, case_id in enumerate(self.case_ids, 1):
                 self.case_progress.emit(idx, len(self.case_ids))
-                self.progress.emit(f"\nProcessing case {idx}/{len(self.case_ids)}: {case_id}")
+                self.progress.emit(
+                    f"\nProcessing case {idx}/{len(self.case_ids)}: {case_id}")
 
                 try:
+                    # Refresh token periodically (every 5 cases)
+                    if idx > 1 and idx % 5 == 0:
+                        self._maybe_refresh_token()
+
+                    # Determine date range
+                    existing = catalog.get(case_id, {})
+                    existing_file = DATA_DIR / f"{case_id}.xlsx"
+                    last_data = existing.get("last_data")
+
+                    if last_data and existing_file.exists():
+                        # Incremental: from last_data minus 1 day overlap
+                        start_dt = datetime.fromisoformat(last_data).replace(
+                            tzinfo=timezone.utc) - timedelta(days=1)
+                        self.progress.emit(
+                            f"  Incremental update from "
+                            f"{start_dt.strftime('%Y-%m-%d')}")
+                    else:
+                        # Full download
+                        start_dt = now - timedelta(days=self.days)
+                        self.progress.emit(
+                            f"  Full download, last {self.days} days")
+
+                    end_dt = now
+
                     # Step 1: Find asset
                     self.step_progress.emit(f"Looking up {case_id}...")
                     asset = self._find_asset(case_id)
@@ -323,70 +488,113 @@ class DownloadWorker(QObject):
                         continue
 
                     asset_id = asset["id"]
-                    self.progress.emit(f"  Found asset (internal ID: {asset_id})")
+                    meta = self._extract_metadata(asset)
+                    self.progress.emit(
+                        f"  Found: {meta['model']}  |  "
+                        f"{meta['alt_name']}  |  "
+                        f"Store {meta['store']} {meta['store_name']}, "
+                        f"{meta['state']}")
 
                     # Step 2: Get modules
                     self.step_progress.emit(f"Getting modules for {case_id}...")
                     modules = self._get_modules(asset_id)
                     if not modules:
-                        self.progress.emit(f"  X No modules found for {case_id}")
+                        self.progress.emit(
+                            f"  X No modules found for {case_id}")
                         failed.append(case_id)
                         continue
 
-                    self.progress.emit(f"  Found {len(modules)} module(s)")
+                    mod_names = [m.get("name", f"Module_{i}")
+                                 for i, m in enumerate(modules, 1)]
+                    self.progress.emit(
+                        f"  {len(modules)} module(s): {', '.join(mod_names)}")
 
                     all_sheets = {}
 
-                    # Step 3: For each module, download telemetry
+                    # Step 3: Download telemetry for each module
                     for m_idx, module in enumerate(modules, 1):
                         mod_name = module.get("name", f"Module_{m_idx}")
                         ext_id = module.get("externalId")
                         if not ext_id:
-                            self.progress.emit(f"  X Module {mod_name} has no externalId, skipping")
+                            self.progress.emit(
+                                f"  X Module {mod_name} has no externalId")
                             continue
 
-                        self.progress.emit(f"  Module {m_idx}/{len(modules)}: {mod_name}")
+                        self.progress.emit(
+                            f"  Module {m_idx}/{len(modules)}: {mod_name}")
 
-                        # Group attributes by service type
-                        by_service = {}
-                        for attr_def in CASE_STATUS_ATTRS:
+                        # Group attrs by service type
+                        by_service: Dict[str, list] = {}
+                        for attr_def in CASE_ATTRS:
                             st = attr_def["serviceType"]
                             by_service.setdefault(st, []).append(attr_def)
 
                         for svc_type, attrs in by_service.items():
-                            svc_label = "sensor-data" if "data" in svc_type else "sensor-event"
+                            svc_label = ("sensor-data" if "data" in svc_type
+                                         else "sensor-event")
                             self.step_progress.emit(
-                                f"{mod_name}: Downloading {svc_label}..."
-                            )
-                            self.progress.emit(f"    Querying {svc_label} ({len(attrs)} attributes)...")
+                                f"{mod_name}: Downloading {svc_label}...")
+                            self.progress.emit(
+                                f"    Querying {svc_label} "
+                                f"({len(attrs)} attributes)...")
 
-                            df = self._query_telemetry(ext_id, svc_type, attrs, self.hours)
+                            df = self._query_telemetry(
+                                ext_id, svc_type, attrs, start_dt, end_dt)
 
                             if len(df) > 0:
                                 sheet = f"{mod_name}_{svc_label}"
-                                # Excel sheet names cannot contain \ / * [ ] : ?
-                                import re
-                                sheet = re.sub(r'[\\\\/*\[\]:?]', '-', sheet)
-                                # Excel sheet names max 31 chars
-                                if len(sheet) > 31:
-                                    sheet = sheet[:31]
                                 all_sheets[sheet] = df
-                                self.progress.emit(f"    OK  {len(df)} rows for {svc_label}")
+                                self.progress.emit(
+                                    f"    OK  {len(df)} rows")
                             else:
-                                self.progress.emit(f"    --  No {svc_label} data")
+                                self.progress.emit(
+                                    f"    --  No {svc_label} data")
 
-                    # Step 4: Save to Excel
+                    # Step 4: Download store ambient
+                    if meta["store"]:
+                        self.step_progress.emit(
+                            f"Downloading store ambient for {meta['store']}...")
+                        ambient_df = self._download_store_ambient(
+                            meta["store"], start_dt, end_dt)
+                        if ambient_df is not None:
+                            all_sheets["Store_ambient"] = ambient_df
+
+                    # Step 5: Merge + save
                     if all_sheets:
-                        self.step_progress.emit(f"Saving {case_id} to Excel...")
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        out_file = DATA_DIR / f"{case_id}_{ts}.xlsx"
-                        with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
-                            for sheet_name, df in all_sheets.items():
-                                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                        self.progress.emit(f"  OK  Saved: {out_file.name}")
+                        if existing_file.exists():
+                            self.step_progress.emit(
+                                f"Merging with existing data...")
+                            all_sheets = self._merge_sheets(
+                                existing_file, all_sheets)
+                            self.progress.emit(
+                                "  Merged with existing data")
+
+                        self.step_progress.emit(
+                            f"Saving {case_id}.xlsx...")
+                        self._safe_write_excel(existing_file, all_sheets)
+
+                        # Count total rows
+                        total_rows = sum(len(df) for df in all_sheets.values())
+                        self.progress.emit(
+                            f"  OK  Saved: {case_id}.xlsx "
+                            f"({total_rows} total rows)")
                         successful.append(case_id)
+
+                        # Update catalog
+                        catalog[case_id] = {
+                            **meta,
+                            "modules": mod_names,
+                            "first_data": (
+                                existing.get("first_data")
+                                or start_dt.isoformat()),
+                            "last_data": end_dt.isoformat(),
+                            "last_updated": datetime.now().isoformat(),
+                            "total_rows": total_rows,
+                        }
+                        save_catalog(catalog)
                     else:
-                        self.progress.emit(f"  X No data to save for {case_id}")
+                        self.progress.emit(
+                            f"  X No data to save for {case_id}")
                         failed.append(case_id)
 
                 except Exception as e:
@@ -398,12 +606,15 @@ class DownloadWorker(QObject):
             summary = f"\n{sep}\nDownload Complete!\n{sep}\n"
             summary += f"Successful: {len(successful)}\n"
             for c in successful:
-                summary += f"  OK  {c}\n"
+                cat = catalog.get(c, {})
+                summary += (f"  OK  {c}  ({cat.get('model', '?')}  "
+                            f"Store {cat.get('store', '?')})\n")
             if failed:
                 summary += f"\nFailed: {len(failed)}\n"
                 for c in failed:
                     summary += f"  X  {c}\n"
             summary += f"\nFiles saved to: {DATA_DIR}\n"
+            summary += f"Catalog: {CATALOG_FILE}\n"
 
             self.progress.emit(summary)
             self.finished.emit(len(failed) == 0, summary)
@@ -436,12 +647,11 @@ class OneConnectApp(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        # ── Tab 1: Download ───────────────────────────────────────────
+        # == Tab 1: Download ==================================================
         download_tab = QWidget()
-        self.tabs.addTab(download_tab, "📥  Download")
+        self.tabs.addTab(download_tab, "Download")
         layout = QVBoxLayout(download_tab)
 
-        # Title
         title = QLabel("OneConnect Graph Data Download")
         font = QFont()
         font.setPointSize(14)
@@ -449,14 +659,17 @@ class OneConnectApp(QMainWindow):
         title.setFont(font)
         layout.addWidget(title)
 
-        subtitle = QLabel("Microblock-Cases  |  Dollar General")
+        subtitle = QLabel("Microblock-Cases  |  Dollar General  |  "
+                          "One file per case, incremental updates")
         subtitle.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(subtitle)
 
         # Input area
-        layout.addWidget(QLabel("Enter Case IDs (one per line or comma-separated):"))
+        layout.addWidget(QLabel(
+            "Enter Case IDs (one per line or comma-separated):"))
         self.input_text = QTextEdit()
-        self.input_text.setPlaceholderText("MY26C019878\nMY25L086318\nMY26B013808")
+        self.input_text.setPlaceholderText(
+            "MY26C019878\nMY25L086318\nMY26B013808")
         self.input_text.setMaximumHeight(90)
         layout.addWidget(self.input_text)
 
@@ -471,13 +684,25 @@ class OneConnectApp(QMainWindow):
 
         btn_row.addStretch()
 
-        btn_row.addWidget(QLabel("Hours of data:"))
-        self.hours_spin = QSpinBox()
-        self.hours_spin.setRange(1, 168)   # 1 hour to 7 days
-        self.hours_spin.setValue(24)
-        btn_row.addWidget(self.hours_spin)
+        btn_row.addWidget(QLabel("Days of data:"))
+        self.days_spin = QSpinBox()
+        self.days_spin.setRange(1, 90)
+        self.days_spin.setValue(90)
+        self.days_spin.setToolTip(
+            "How far back to download for NEW cases.\n"
+            "Existing cases auto-update from last download.")
+        btn_row.addWidget(self.days_spin)
 
         layout.addLayout(btn_row)
+
+        # Info label
+        info = QLabel(
+            "New cases: downloads last N days.  "
+            "Existing cases: auto-updates from last download (incremental).  "
+            "Store ambient (temp/RH/dewpoint) downloaded automatically.")
+        info.setStyleSheet("color:#666; font-size:10px; font-style:italic;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
 
         # Case table
         layout.addWidget(QLabel("Cases to Download:"))
@@ -488,7 +713,7 @@ class OneConnectApp(QMainWindow):
         self.table.setMaximumHeight(160)
         layout.addWidget(self.table)
 
-        # Download button
+        # Download button row
         dl_row = QHBoxLayout()
         self.download_btn = QPushButton("  Download Data  ")
         self.download_btn.setStyleSheet(
@@ -525,29 +750,24 @@ class OneConnectApp(QMainWindow):
         self.status_text.setReadOnly(True)
         layout.addWidget(self.status_text)
 
-        # ── Tab 2: Diagnostics ────────────────────────────────────────
+        # == Tab 2: Diagnostics ================================================
         self.diag_widget = DiagnosticsWidget()
-        self.tabs.addTab(self.diag_widget, "🔍  Diagnostics")
+        self.tabs.addTab(self.diag_widget, "Diagnostics")
 
-        # Refresh diagnostics case list after a download completes
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _on_tab_changed(self, index):
-        """Refresh the case list when switching to Diagnostics tab."""
         if index == 1:
             self.diag_widget.refresh_cases()
 
     # ---- credentials ----
     def _load_credentials(self):
-        """Load saved RTA and token."""
         if RTA_FILE.exists():
             self.rta = RTA_FILE.read_text().strip()
-
         if TOKEN_FILE.exists():
             self.token = TOKEN_FILE.read_text().strip()
 
         if self.rta and len(self.rta) > 10:
-            # Try to get a fresh token
             self._log("Refreshing auth token...")
             new_token = refresh_token(self.rta)
             if new_token:
@@ -562,14 +782,12 @@ class OneConnectApp(QMainWindow):
             self._ask_rta()
 
     def _ask_rta(self):
-        """Ask user for their Refresh Token (RTA) with custom dialog."""
         dlg = TokenInputDialog(self)
         if dlg.exec_() == QDialog.Accepted and dlg.token:
             self.rta = dlg.token
             RTA_FILE.parent.mkdir(parents=True, exist_ok=True)
             RTA_FILE.write_text(self.rta)
 
-            # Immediately get a fresh token
             self._log("Testing RTA...")
             new_token = refresh_token(self.rta)
             if new_token:
@@ -578,7 +796,8 @@ class OneConnectApp(QMainWindow):
                 self._log("OK  RTA is valid! Token saved.")
             else:
                 self._log("X  RTA did not work. Please try again.")
-                QMessageBox.warning(self, "Error", "Could not get token with that RTA. Please try again.")
+                QMessageBox.warning(self, "Error",
+                    "Could not get token with that RTA. Please try again.")
         else:
             if not self.token:
                 QMessageBox.warning(self, "Warning",
@@ -588,14 +807,15 @@ class OneConnectApp(QMainWindow):
     def _add_case_ids(self):
         text = self.input_text.toPlainText().strip()
         if not text:
-            QMessageBox.warning(self, "Error", "Please enter at least one case ID")
+            QMessageBox.warning(self, "Error",
+                "Please enter at least one case ID")
             return
 
-        ids = [c.strip().upper() for c in text.replace(",", "\n").split("\n") if c.strip()]
+        ids = [c.strip().upper()
+               for c in text.replace(",", "\n").split("\n") if c.strip()]
         if not ids:
             return
 
-        # Check for duplicates
         existing = set()
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
@@ -609,23 +829,25 @@ class OneConnectApp(QMainWindow):
                 self.table.insertRow(row)
                 self.table.setItem(row, 0, QTableWidgetItem(cid))
                 rm_btn = QPushButton("Remove")
-                rm_btn.clicked.connect(lambda _, r=row: self._remove_case(r))
+                rm_btn.clicked.connect(
+                    lambda _, r=row: self._remove_case(r))
                 self.table.setCellWidget(row, 1, rm_btn)
                 existing.add(cid)
                 added += 1
 
         self.input_text.clear()
-        self._log(f"OK  Added {added} case ID(s)  (total: {self.table.rowCount()})")
+        self._log(f"OK  Added {added} case ID(s)  "
+                  f"(total: {self.table.rowCount()})")
 
     def _remove_case(self, row: int):
         if 0 <= row < self.table.rowCount():
             self.table.removeRow(row)
-            # Reconnect remaining remove buttons
             for r in range(self.table.rowCount()):
                 btn = self.table.cellWidget(r, 1)
                 if btn:
                     btn.clicked.disconnect()
-                    btn.clicked.connect(lambda _, rr=r: self._remove_case(rr))
+                    btn.clicked.connect(
+                        lambda _, rr=r: self._remove_case(rr))
 
     def _clear_cases(self):
         self.table.setRowCount(0)
@@ -633,40 +855,31 @@ class OneConnectApp(QMainWindow):
 
     # ---- quick reference ----
     def _show_quick_ref(self):
-        """Show all browser console commands user might need."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Quick Reference - Browser Console Commands")
         dlg.setFixedSize(600, 400)
-
         layout = QVBoxLayout(dlg)
 
         text_area = QTextBrowser()
         text_area.setHtml("""
-<html><body style="background:#1a1a2e; color:#e0e0e0; font-family:Consolas,monospace; font-size:11px; padding:10px;">
+<html><body style="background:#1a1a2e; color:#e0e0e0;
+font-family:Consolas,monospace; font-size:11px; padding:10px;">
 <h2 style="color:#42A5F5;">Browser Console Commands</h2>
-<p>Copy &amp; paste these into your browser's <b>Console tab</b> (F12 → Console).</p>
+<p>Copy &amp; paste into browser <b>Console tab</b> (F12).</p>
 
-<h3 style="color:#FFA726;">Get RTA Token (One-Time Setup)</h3>
-<p style="background:#16213e; padding:8px; border-radius:4px; border-left:3px solid #42A5F5;">
-<code>localStorage.getItem('RTA')</code>
-</p>
-<p><b>When:</b> First time using the app, or when "Update Token" asks for it<br/>
-<b>Result:</b> Token like <code>5c227fcf-369b-...</code></p>
+<h3 style="color:#FFA726;">Get RTA Token</h3>
+<p style="background:#16213e; padding:8px; border-radius:4px;
+border-left:3px solid #42A5F5;">
+<code>localStorage.getItem('RTA')</code></p>
 
-<h3 style="color:#FFA726;">Check Current Bearer Token</h3>
-<p style="background:#16213e; padding:8px; border-radius:4px; border-left:3px solid #42A5F5;">
-<code>localStorage.getItem('TOKEN')</code>
-</p>
-<p><b>When:</b> If you need to verify the app's current session token</p>
-
-<h3 style="color:#FFA726;">Check All Auth Values</h3>
-<p style="background:#16213e; padding:8px; border-radius:4px; border-left:3px solid #42A5F5;">
-<code>console.table(Object.keys(localStorage).filter(k => k.includes('TOKEN') || k.includes('RTA')))</code>
-</p>
-<p><b>When:</b> To see all auth data in storage</p>
+<h3 style="color:#FFA726;">Check Bearer Token</h3>
+<p style="background:#16213e; padding:8px; border-radius:4px;
+border-left:3px solid #42A5F5;">
+<code>localStorage.getItem('TOKEN')</code></p>
 
 <hr style="border-color:#333;"/>
-<p style="color:#999; font-size:10px;">Copy each command, paste into Console, press Enter.</p>
+<p style="color:#999; font-size:10px;">
+Copy command, paste into Console, press Enter.</p>
 </body></html>
 """)
         text_area.setStyleSheet(
@@ -678,13 +891,13 @@ class OneConnectApp(QMainWindow):
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(dlg.accept)
         layout.addWidget(close_btn)
-
         dlg.exec_()
 
     # ---- download ----
     def _start_download(self):
         if self.table.rowCount() == 0:
-            QMessageBox.warning(self, "Error", "Please add at least one case ID")
+            QMessageBox.warning(self, "Error",
+                "Please add at least one case ID")
             return
 
         if not self.rta:
@@ -692,24 +905,20 @@ class OneConnectApp(QMainWindow):
                 "No Refresh Token set. Click 'Update Token' first.")
             return
 
-        # Collect case IDs
         case_ids = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item:
                 case_ids.append(item.text())
 
-        # Disable controls
         self.download_btn.setEnabled(False)
         self.add_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
-
         self.status_text.clear()
         self.progress_bar.setValue(0)
 
-        # Create worker thread
-        hours = self.hours_spin.value()
-        self.worker = DownloadWorker(case_ids, self.token, self.rta, hours)
+        days = self.days_spin.value()
+        self.worker = DownloadWorker(case_ids, self.token, self.rta, days)
         self.download_thread = QThread()
         self.worker.moveToThread(self.download_thread)
 
@@ -719,22 +928,24 @@ class OneConnectApp(QMainWindow):
         self.worker.finished.connect(self._download_finished)
         self.download_thread.started.connect(self.worker.run)
 
-        self._log(f"Starting download for {len(case_ids)} case(s), last {hours} hours...")
+        self._log(f"Starting download for {len(case_ids)} case(s), "
+                  f"last {days} days (existing cases update incrementally)...")
         self.download_thread.start()
 
     def _download_finished(self, success: bool, message: str):
         self.download_thread.quit()
         self.download_thread.wait()
-
         self.download_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.step_label.setText("Done")
 
         if success:
-            QMessageBox.information(self, "Success", "All cases downloaded successfully!")
+            QMessageBox.information(self, "Success",
+                "All cases downloaded successfully!")
         else:
-            QMessageBox.warning(self, "Completed with Errors", "Some cases failed. Check the log.")
+            QMessageBox.warning(self, "Completed with Errors",
+                "Some cases failed. Check the log.")
 
     # ---- UI helpers ----
     def _log(self, msg: str):
