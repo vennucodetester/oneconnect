@@ -1,0 +1,23 @@
+# Credentials - never commit these
+token.txt
+rta.txt
+auth_state.json
+
+# Downloaded data
+downloads/
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Excel temp files
+~$*.xlsx
+
+# IDE
+.vscode/
+.idea/
+
+# Failure pattern data (generated)
+failure_patterns/

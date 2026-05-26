@@ -19,7 +19,10 @@
       "Bash(python -c ' *)",
       "mcp__Claude_in_Chrome__tabs_create_mcp",
       "mcp__Claude_in_Chrome__read_page",
-      "mcp__Claude_in_Chrome__read_network_requests"
+      "mcp__Claude_in_Chrome__read_network_requests",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
