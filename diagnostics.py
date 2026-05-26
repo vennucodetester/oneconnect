@@ -1,8 +1,11 @@
 """
 Diagnostics tab - interactive charts and automated anomaly detection
+Rules engine: user-editable expressions (like Excel IF statements)
 """
 
+import ast
 import json
+import operator
 import re
 import tempfile
 import webbrowser
@@ -22,9 +25,12 @@ except ImportError:
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
     QLineEdit, QPushButton, QLabel, QDialog, QFormLayout,
-    QDoubleSpinBox, QSpinBox, QComboBox, QDialogButtonBox, QTextEdit
+    QDoubleSpinBox, QSpinBox, QComboBox, QDialogButtonBox, QTextEdit,
+    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QAbstractItemView,
+    QMessageBox, QScrollArea, QSizePolicy
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor
 
 DATA_DIR = Path("C:\\Users\\silam\\OneC\\downloads")
 CONFIG_FILE = Path("C:\\Users\\silam\\OneC\\case_config.json")
@@ -47,6 +53,62 @@ DEFAULT_CONFIGS = {
         "door_rise_per_15min": 8.0,
     },
 }
+
+# ---------------------------------------------------------------------------
+#  Default rules  (user can edit these per-case)
+#  Variables available in expressions:
+#    setpoint, threshold, door_rate
+#    defrost_count, defrost_failed_count, defrost_failed_pct
+#    alarm_count
+#    temp_rise_15min   (max °F rise in any 15-min window)
+#    post_defrost_floor_drift  (+ means getting warmer after each defrost)
+#    high_temp_hours   (hours temp was above setpoint + 8°F)
+#    max_temp, min_temp
+#  Operators: + - * /  AND OR NOT  >= <= > < == !=
+# ---------------------------------------------------------------------------
+
+DEFAULT_RULES = [
+    {
+        "name": "Icing in coil",
+        "expression": "defrost_failed_pct >= 50",
+        "level": "critical",
+        "enabled": True,
+        "icon": "🧊",
+        "detail": "defrost_failed_pct:.0f% of defrosts did not reach threshold",
+    },
+    {
+        "name": "Early icing (floor drift)",
+        "expression": "post_defrost_floor_drift >= 3.0",
+        "level": "warning",
+        "enabled": True,
+        "icon": "📈",
+        "detail": "Post-defrost temp floor rising +post_defrost_floor_drift:.1f°F",
+    },
+    {
+        "name": "Door left open",
+        "expression": "temp_rise_15min >= door_rate",
+        "level": "critical",
+        "enabled": True,
+        "icon": "🚪",
+        "detail": "Temp rose temp_rise_15min:.1f°F in 15 min",
+    },
+    {
+        "name": "Air leak / warm load",
+        "expression": "high_temp_hours >= 0.5 AND temp_rise_15min < door_rate",
+        "level": "warning",
+        "enabled": True,
+        "icon": "💨",
+        "detail": "Temp above setpoint+8°F for high_temp_hours:.1f hours",
+    },
+    {
+        "name": "Active alarms",
+        "expression": "alarm_count > 0",
+        "level": "critical",
+        "enabled": True,
+        "icon": "🚨",
+        "detail": "alarm_count alarm event(s) in this period",
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +138,26 @@ class CaseConfig:
         self.data.setdefault("cases", {})[case_id] = cfg
         self.save()
 
+    def get_rules(self, case_id: str) -> List[dict]:
+        """Return per-case rules, or fall back to global rules, or defaults."""
+        case_cfg = self.data.get("cases", {}).get(case_id, {})
+        if "rules" in case_cfg:
+            return [r.copy() for r in case_cfg["rules"]]
+        global_rules = self.data.get("global_rules")
+        if global_rules:
+            return [r.copy() for r in global_rules]
+        return [r.copy() for r in DEFAULT_RULES]
+
+    def set_rules(self, case_id: str, rules: List[dict]):
+        """Save rules for a specific case."""
+        self.data.setdefault("cases", {}).setdefault(case_id, {})["rules"] = rules
+        self.save()
+
+    def set_global_rules(self, rules: List[dict]):
+        """Save rules that apply to all cases (unless case has its own)."""
+        self.data["global_rules"] = rules
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 #  Data loading
@@ -94,15 +176,29 @@ def get_downloaded_cases() -> List[str]:
 
 
 def load_case_data(case_id: str) -> Optional[Dict]:
-    """Returns {module_name: {sensor_data: df, sensor_event: df}}"""
+    """
+    Returns {
+        "_meta": {"file": filename, "downloaded": mtime, "all_files": N},
+        module_name: {"sensor_data": df, "sensor_event": df},
+        ...
+    }
+    Always picks the most recently downloaded file.
+    """
     files = sorted(DATA_DIR.glob(f"{case_id}_*.xlsx"), reverse=True)
     if not files:
         return None
+    latest = files[0]
     try:
-        xl = pd.ExcelFile(files[0])
-        modules: Dict = {}
+        xl = pd.ExcelFile(latest)
+        modules: Dict = {
+            "_meta": {
+                "file": latest.name,
+                "downloaded": latest.stat().st_mtime,
+                "all_files": len(files),
+            }
+        }
         for sheet in xl.sheet_names:
-            df = pd.read_excel(files[0], sheet_name=sheet)
+            df = pd.read_excel(latest, sheet_name=sheet)
             if "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 df = df.sort_values("timestamp").reset_index(drop=True)
@@ -112,7 +208,8 @@ def load_case_data(case_id: str) -> Optional[Dict]:
             elif "_sensor-event" in sheet:
                 mod = sheet.split("_sensor-event")[0]
                 modules.setdefault(mod, {})["sensor_event"] = df
-        return modules or None
+        data_keys = [k for k in modules if k != "_meta"]
+        return modules if data_keys else None
     except Exception as e:
         print(f"Error loading {case_id}: {e}")
         return None
@@ -171,82 +268,200 @@ def get_alarm_times(df_event: pd.DataFrame) -> list:
 
 
 # ---------------------------------------------------------------------------
-#  Diagnostics engine
+#  Metrics computation  (feeds the rules engine)
 # ---------------------------------------------------------------------------
 
-def run_diagnostics(modules: Dict, config: dict) -> List[dict]:
-    findings = []
+def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame, config: dict) -> dict:
+    """
+    Compute all numeric variables that can be referenced in rule expressions.
+    Returns a flat dict of floats/ints.
+    """
     threshold = config.get("defrost_terminate_threshold", 35.0)
-    sync_tol  = config.get("sync_tolerance_min", 30)
     setpoint  = config.get("setpoint", -10.0)
     door_rate = config.get("door_rise_per_15min", 5.0)
-    mod_names = list(modules.keys())
 
-    for mod_name, data in modules.items():
-        df_d = data.get("sensor_data", pd.DataFrame())
+    m = {
+        # Config values (also available in expressions)
+        "setpoint":   setpoint,
+        "threshold":  threshold,
+        "door_rate":  door_rate,
+        # Defrost
+        "defrost_count":        0,
+        "defrost_failed_count": 0,
+        "defrost_failed_pct":   0.0,
+        # Alarms
+        "alarm_count":          0,
+        # Temperature behavior
+        "temp_rise_15min":            0.0,
+        "post_defrost_floor_drift":   0.0,
+        "high_temp_hours":            0.0,
+        "max_temp":                   0.0,
+        "min_temp":                   0.0,
+    }
+
+    # Defrost stats
+    periods = detect_defrost_periods(df_d, threshold)
+    m["defrost_count"] = len(periods)
+    bad = [p for p in periods if not p["terminated_ok"]]
+    m["defrost_failed_count"] = len(bad)
+    m["defrost_failed_pct"] = (len(bad) / len(periods) * 100) if periods else 0.0
+
+    # Alarms
+    m["alarm_count"] = len(get_alarm_times(df_e))
+
+    if not df_d.empty and "Control Temperature" in df_d.columns:
+        df_s = df_d.sort_values("timestamp").copy()
+        m["max_temp"] = float(df_s["Control Temperature"].max())
+        m["min_temp"] = float(df_s["Control Temperature"].min())
+
+        # Max temp rise in any 15-min block
+        df_s["_block"] = ((df_s["timestamp"] - df_s["timestamp"].iloc[0])
+                          .dt.total_seconds() // 900).astype(int)
+        block_avg = df_s.groupby("_block")["Control Temperature"].mean()
+        rises = block_avg.diff()
+        m["temp_rise_15min"] = float(rises.max()) if not rises.empty and pd.notna(rises.max()) else 0.0
+
+        # Hours above setpoint + 8
+        high = df_s[df_s["Control Temperature"] > setpoint + 8]
+        if len(high) > 1:
+            m["high_temp_hours"] = float(
+                (high["timestamp"].max() - high["timestamp"].min()).total_seconds() / 3600
+            )
+
+        # Post-defrost floor drift (last post-defrost min vs first)
+        floors = []
+        for p in periods:
+            w_end = p["end"] + pd.Timedelta(minutes=45)
+            seg = df_d[(df_d["timestamp"] >= p["end"]) & (df_d["timestamp"] <= w_end)]
+            if not seg.empty and "Control Temperature" in seg.columns:
+                floors.append(float(seg["Control Temperature"].min()))
+        if len(floors) >= 2:
+            m["post_defrost_floor_drift"] = floors[-1] - floors[0]
+
+    return m
+
+
+# ---------------------------------------------------------------------------
+#  Rules engine  (safe expression evaluator)
+# ---------------------------------------------------------------------------
+
+class RulesEngine:
+    """
+    Evaluates user-written expressions like:
+      "defrost_failed_pct >= 50"
+      "temp_rise_15min >= door_rate AND alarm_count > 0"
+      "(max_temp - setpoint) >= 15"
+
+    Supported:  + - * /  parentheses  AND OR NOT  >= <= > < == !=
+    No Python builtins are exposed — only the metrics dict values.
+    """
+
+    # Safe AST node types we allow
+    _ALLOWED = {
+        ast.Expression, ast.BoolOp, ast.BinOp, ast.UnaryOp, ast.Compare,
+        ast.And, ast.Or, ast.Not,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+        ast.USub, ast.UAdd,
+        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.Constant, ast.Name, ast.IfExp, ast.Load,
+    }
+
+    @classmethod
+    def _check_node(cls, node):
+        if type(node) not in cls._ALLOWED:
+            raise ValueError(f"Unsupported expression element: {type(node).__name__}")
+        for child in ast.iter_child_nodes(node):
+            cls._check_node(child)
+
+    @classmethod
+    def evaluate(cls, expression: str, variables: dict) -> bool:
+        """Returns True/False. Returns False on any error."""
+        try:
+            # Normalise Excel-style keywords to Python
+            expr = re.sub(r'\bAND\b', 'and', expression)
+            expr = re.sub(r'\bOR\b',  'or',  expr)
+            expr = re.sub(r'\bNOT\b', 'not', expr)
+            expr = re.sub(r'\bTRUE\b',  'True',  expr, flags=re.IGNORECASE)
+            expr = re.sub(r'\bFALSE\b', 'False', expr, flags=re.IGNORECASE)
+
+            tree = ast.parse(expr, mode='eval')
+            cls._check_node(tree)
+
+            safe_ns = {"__builtins__": {}, "True": True, "False": False}
+            safe_ns.update({k: v for k, v in variables.items() if v is not None})
+            return bool(eval(compile(tree, "<rule>", "eval"), safe_ns))
+        except Exception:
+            return False
+
+    @classmethod
+    def test_expression(cls, expression: str, variables: dict) -> tuple:
+        """Returns (ok: bool, result_or_error: str)"""
+        try:
+            expr = re.sub(r'\bAND\b', 'and', expression)
+            expr = re.sub(r'\bOR\b',  'or',  expr)
+            expr = re.sub(r'\bNOT\b', 'not', expr)
+            tree = ast.parse(expr, mode='eval')
+            cls._check_node(tree)
+            safe_ns = {"__builtins__": {}, "True": True, "False": False}
+            safe_ns.update({k: v for k, v in variables.items() if v is not None})
+            result = eval(compile(tree, "<rule>", "eval"), safe_ns)
+            return True, f"= {result}"
+        except Exception as e:
+            return False, str(e)
+
+
+def _format_detail(template: str, metrics: dict) -> str:
+    """
+    Render a detail string like "defrost_failed_pct:.0f% of defrosts failed"
+    by substituting variable:format patterns with actual values.
+    """
+    def replacer(m):
+        varname = m.group(1)
+        fmt = m.group(2) or ""
+        val = metrics.get(varname)
+        if val is None:
+            return varname
+        try:
+            return format(val, fmt) if fmt else str(round(val, 2))
+        except Exception:
+            return str(val)
+    return re.sub(r'(\w+)(:[^,\s]+)?', replacer, template)
+
+
+# ---------------------------------------------------------------------------
+#  Diagnostics engine  (uses rules)
+# ---------------------------------------------------------------------------
+
+def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> List[dict]:
+    if rules is None:
+        rules = DEFAULT_RULES
+
+    findings = []
+    mod_names = [k for k in modules.keys() if k != "_meta"]
+    threshold = config.get("defrost_terminate_threshold", 35.0)
+
+    for mod_name in mod_names:
+        data = modules[mod_name]
+        df_d = data.get("sensor_data",  pd.DataFrame())
         df_e = data.get("sensor_event", pd.DataFrame())
 
-        # ── Defrost analysis ──────────────────────────────────────────
-        periods = detect_defrost_periods(df_d, threshold)
-        if periods:
-            bad = [p for p in periods if not p["terminated_ok"]]
-            if bad:
+        metrics = compute_metrics(df_d, df_e, config)
+
+        for rule in rules:
+            if not rule.get("enabled", True):
+                continue
+            if RulesEngine.evaluate(rule["expression"], metrics):
+                icon   = rule.get("icon", "⚠")
+                detail = _format_detail(rule.get("detail", ""), metrics)
                 findings.append({
-                    "level": "critical", "type": "icing", "module": mod_name,
-                    "msg": (f"🧊 [{mod_name}] {len(bad)}/{len(periods)} defrosts "
-                            f"did NOT reach {threshold}°F — likely icing in coil"),
+                    "level":  rule.get("level", "warning"),
+                    "type":   rule["name"],
+                    "module": mod_name,
+                    "msg":    f"{icon} [{mod_name}] {rule['name']}: {detail}",
                 })
 
-            # Post-defrost temperature floor trend
-            floors = []
-            for p in periods:
-                w_end = p["end"] + pd.Timedelta(minutes=45)
-                seg = df_d[(df_d["timestamp"] >= p["end"]) & (df_d["timestamp"] <= w_end)]
-                if not seg.empty and "Control Temperature" in seg.columns:
-                    floors.append(seg["Control Temperature"].min())
-            if len(floors) >= 2:
-                drift = floors[-1] - floors[0]
-                if drift > 3.0:
-                    findings.append({
-                        "level": "warning", "type": "icing_early", "module": mod_name,
-                        "msg": (f"📈 [{mod_name}] Post-defrost temp floor rising "
-                                f"+{drift:.1f}°F — early icing sign"),
-                    })
-
-        # ── Door open / air leak ─────────────────────────────────────
-        if not df_d.empty and "Control Temperature" in df_d.columns:
-            df_s = df_d.sort_values("timestamp").copy()
-            df_s["block"] = ((df_s["timestamp"] - df_s["timestamp"].iloc[0])
-                             .dt.total_seconds() // 900).astype(int)
-            block_avg  = df_s.groupby("block")["Control Temperature"].mean()
-            max_rise   = block_avg.diff().max()
-
-            if pd.notna(max_rise) and max_rise >= door_rate:
-                findings.append({
-                    "level": "critical", "type": "door_open", "module": mod_name,
-                    "msg": (f"🚪 [{mod_name}] Temp rose {max_rise:.1f}°F in 15 min "
-                            f"— possible door left open"),
-                })
-            else:
-                high = df_s[df_s["Control Temperature"] > setpoint + 8]
-                if len(high) > 3:
-                    hrs = (high["timestamp"].max() - high["timestamp"].min()).total_seconds() / 3600
-                    if hrs >= 0.5:
-                        findings.append({
-                            "level": "warning", "type": "air_leak", "module": mod_name,
-                            "msg": (f"💨 [{mod_name}] Temp above setpoint+8°F for "
-                                    f"{hrs:.1f}h — possible air leak"),
-                        })
-
-        # ── Alarms ───────────────────────────────────────────────────
-        alarms = get_alarm_times(df_e)
-        if alarms:
-            findings.append({
-                "level": "critical", "type": "alarm", "module": mod_name,
-                "msg": f"🚨 [{mod_name}] {len(alarms)} alarm event(s) in this period",
-            })
-
-    # ── Defrost sync (only with 2 modules) ───────────────────────────
+    # Defrost sync check (only when 2 modules present)
+    sync_tol = config.get("sync_tolerance_min", 30)
     if len(mod_names) == 2:
         a, b = mod_names
         pa = detect_defrost_periods(modules[a].get("sensor_data", pd.DataFrame()), threshold)
@@ -278,7 +493,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
     setpoint  = config.get("setpoint", -10.0)
     threshold = config.get("defrost_terminate_threshold", 35.0)
     case_type = config.get("case_type", "LT")
-    mod_names = list(modules.keys())
+    mod_names = [k for k in modules.keys() if k != "_meta"]
     n = len(mod_names)
     if n == 0:
         return "<html><body style='background:#1a1a2e;color:#aaa'><p>No data</p></body></html>"
@@ -315,7 +530,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
         if not df_d.empty:
             ts = df_d["timestamp"]
 
-            # Reference lines as scatter traces
+            # Setpoint reference
             fig.add_trace(go.Scatter(
                 x=[ts.min(), ts.max()], y=[setpoint, setpoint],
                 name="Setpoint", mode="lines",
@@ -324,6 +539,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
             ), row=ri, col=1, secondary_y=False)
             sp_shown = True
 
+            # Defrost threshold reference
             fig.add_trace(go.Scatter(
                 x=[ts.min(), ts.max()], y=[threshold, threshold],
                 name=f"Defrost threshold ({threshold}°F)", mode="lines",
@@ -360,10 +576,20 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Comp. Discharge: %{y:.1f}°F<extra></extra>",
                 ), row=ri, col=1, secondary_y=True)
 
-        # Alarm lines
-        for alarm_ts in get_alarm_times(df_e):
-            fig.add_vline(x=str(alarm_ts), line_color="red",
-                          line_width=2, row=ri, col=1)
+        # Alarm markers
+        alarm_times = get_alarm_times(df_e)
+        if alarm_times:
+            fig.add_trace(go.Scatter(
+                x=alarm_times,
+                y=[None] * len(alarm_times),
+                mode="markers",
+                marker=dict(symbol="line-ns", size=30, color="red",
+                            line=dict(color="red", width=2)),
+                name="Alarm",
+                legendgroup="alarm",
+                showlegend=(ri == 1),
+                hovertemplate="<b>ALARM</b><br>%{x|%m/%d %H:%M}<extra></extra>",
+            ), row=ri, col=1, secondary_y=False)
 
         fig.update_yaxes(title_text="Temp (°F)", row=ri, col=1, secondary_y=False,
                          showgrid=True, gridcolor="rgba(255,255,255,0.07)")
@@ -392,7 +618,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Config dialog
+#  Case config dialog
 # ---------------------------------------------------------------------------
 
 class CaseConfigDialog(QDialog):
@@ -432,17 +658,17 @@ class CaseConfigDialog(QDialog):
             w.setValue(int(val))
             return w
 
-        self.w_setpoint   = ds(cfg.get("setpoint", -10),                  -60,  60)
-        self.w_threshold  = ds(cfg.get("defrost_terminate_threshold", 35),  20,  80)
-        self.w_freq       = si(cfg.get("defrost_frequency", 4),              1,  24, "x/day")
-        self.w_sync       = si(cfg.get("sync_tolerance_min", 30),            5, 120, "min")
-        self.w_door       = ds(cfg.get("door_rise_per_15min", 5),            1,  30, "°F/15min")
+        self.w_setpoint  = ds(cfg.get("setpoint", -10),                  -60,  60)
+        self.w_threshold = ds(cfg.get("defrost_terminate_threshold", 35),  20,  80)
+        self.w_freq      = si(cfg.get("defrost_frequency", 4),              1,  24, "x/day")
+        self.w_sync      = si(cfg.get("sync_tolerance_min", 30),            5, 120, "min")
+        self.w_door      = ds(cfg.get("door_rise_per_15min", 5),            1,  30, "°F/15min")
 
-        form.addRow("Setpoint:",                    self.w_setpoint)
-        form.addRow("Defrost terminate ≥:",         self.w_threshold)
-        form.addRow("Expected defrost frequency:",  self.w_freq)
-        form.addRow("Sync tolerance:",              self.w_sync)
-        form.addRow("Door open threshold:",         self.w_door)
+        form.addRow("Setpoint:",                   self.w_setpoint)
+        form.addRow("Defrost terminate ≥:",        self.w_threshold)
+        form.addRow("Expected defrost frequency:", self.w_freq)
+        form.addRow("Sync tolerance:",             self.w_sync)
+        form.addRow("Door open threshold:",        self.w_door)
         layout.addLayout(form)
 
         note = QLabel("One size doesn't fit all — adjust per store as needed.")
@@ -464,13 +690,235 @@ class CaseConfigDialog(QDialog):
 
     def _save(self):
         self.result_config = {
-            "case_type":                    self.type_combo.currentText(),
-            "setpoint":                     self.w_setpoint.value(),
-            "defrost_terminate_threshold":  self.w_threshold.value(),
-            "defrost_frequency":            self.w_freq.value(),
-            "sync_tolerance_min":           self.w_sync.value(),
-            "door_rise_per_15min":          self.w_door.value(),
+            "case_type":                   self.type_combo.currentText(),
+            "setpoint":                    self.w_setpoint.value(),
+            "defrost_terminate_threshold": self.w_threshold.value(),
+            "defrost_frequency":           self.w_freq.value(),
+            "sync_tolerance_min":          self.w_sync.value(),
+            "door_rise_per_15min":         self.w_door.value(),
         }
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+#  Rules editor dialog
+# ---------------------------------------------------------------------------
+
+_VARS_HELP = """\
+Available variables you can use in expressions:
+
+  setpoint          Configured setpoint temp (°F)
+  threshold         Defrost terminate threshold (°F)
+  door_rate         Door-open temp rise threshold (°F/15min)
+
+  defrost_count        Total defrosts detected
+  defrost_failed_count Defrosts that didn't reach threshold
+  defrost_failed_pct   % that failed (0–100)
+
+  alarm_count          Number of alarm events
+
+  temp_rise_15min      Max temp rise in any 15-min window (°F)
+  high_temp_hours      Hours temp was above setpoint + 8°F
+  post_defrost_floor_drift  Drift in post-defrost low temp (°F)
+                            Positive = getting warmer over time
+
+  max_temp / min_temp  Highest / lowest Control Temp seen
+
+Operators:   +  -  *  /  ( )
+Comparisons: >= <= > < == !=
+Logic:       AND  OR  NOT
+
+Examples:
+  defrost_failed_pct >= 50
+  (max_temp - setpoint) >= 15
+  temp_rise_15min >= door_rate AND alarm_count > 0
+  defrost_failed_pct >= 30 OR post_defrost_floor_drift >= 5
+"""
+
+
+class RulesDialog(QDialog):
+    """Edit diagnostic rules for a case (or globally)."""
+
+    def __init__(self, case_id: str, rules: List[dict],
+                 sample_metrics: dict = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Diagnostic Rules  —  {case_id}")
+        self.resize(780, 500)
+        self.rules: List[dict] = [r.copy() for r in rules]
+        self.sample_metrics = sample_metrics or {}
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+
+        # Header
+        hdr = QLabel(
+            "Write rules as expressions — like Excel formulas.\n"
+            "Each rule fires a finding when its expression is TRUE."
+        )
+        hdr.setStyleSheet("color:#aaa; font-size:11px; padding:4px;")
+        layout.addWidget(hdr)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["✓", "Rule name", "Expression", "Level"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().resizeSection(0, 30)
+        self.table.horizontalHeader().resizeSection(1, 160)
+        self.table.horizontalHeader().resizeSection(3, 90)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(
+            "QTableWidget { background:#16213e; color:#e0e0e0; gridline-color:#333; }"
+            "QHeaderView::section { background:#1a1a2e; color:#42A5F5; border:none; padding:4px; }"
+            "QTableWidget::item:selected { background:#42A5F5; color:#000; }"
+        )
+        layout.addWidget(self.table)
+
+        # Populate
+        self._populate()
+
+        # Row action buttons
+        row_btns = QHBoxLayout()
+        btn_add = QPushButton("＋  Add rule")
+        btn_add.clicked.connect(self._add_row)
+        btn_del = QPushButton("✕  Delete selected")
+        btn_del.clicked.connect(self._del_row)
+        btn_reset = QPushButton("↺  Reset to defaults")
+        btn_reset.clicked.connect(self._reset)
+        row_btns.addWidget(btn_add)
+        row_btns.addWidget(btn_del)
+        row_btns.addStretch()
+        row_btns.addWidget(btn_reset)
+        layout.addLayout(row_btns)
+
+        # Test expression area
+        test_row = QHBoxLayout()
+        self.test_expr = QLineEdit()
+        self.test_expr.setPlaceholderText("Test an expression here, e.g.  defrost_failed_pct >= 50")
+        btn_test = QPushButton("Test")
+        btn_test.setFixedWidth(60)
+        btn_test.clicked.connect(self._test_expr)
+        self.test_result = QLabel("")
+        self.test_result.setMinimumWidth(80)
+        test_row.addWidget(QLabel("Try:"))
+        test_row.addWidget(self.test_expr)
+        test_row.addWidget(btn_test)
+        test_row.addWidget(self.test_result)
+        layout.addLayout(test_row)
+
+        # Variables help (collapsible toggle)
+        self.help_visible = False
+        btn_help = QPushButton("📋  Show available variables")
+        btn_help.setCheckable(True)
+        btn_help.toggled.connect(self._toggle_help)
+        layout.addWidget(btn_help)
+
+        self.help_box = QTextEdit()
+        self.help_box.setReadOnly(True)
+        self.help_box.setPlainText(_VARS_HELP)
+        self.help_box.setMaximumHeight(160)
+        self.help_box.setStyleSheet(
+            "QTextEdit { background:#0d0d1a; color:#aaa; font-family:Consolas,monospace; font-size:11px; }"
+        )
+        self.help_box.setVisible(False)
+        layout.addWidget(self.help_box)
+
+        # Dialog buttons
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._save)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _populate(self):
+        self.table.setRowCount(0)
+        for rule in self.rules:
+            self._append_row(rule)
+
+    def _append_row(self, rule: dict):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        # Enabled checkbox
+        chk = QCheckBox()
+        chk.setChecked(rule.get("enabled", True))
+        chk.setStyleSheet("margin-left:6px;")
+        self.table.setCellWidget(row, 0, chk)
+
+        # Name
+        self.table.setItem(row, 1, QTableWidgetItem(rule.get("name", "")))
+
+        # Expression
+        self.table.setItem(row, 2, QTableWidgetItem(rule.get("expression", "")))
+
+        # Level combo
+        combo = QComboBox()
+        combo.addItems(["critical", "warning", "info"])
+        combo.setCurrentText(rule.get("level", "warning"))
+        combo.setStyleSheet("background:#16213e; color:#e0e0e0;")
+        self.table.setCellWidget(row, 3, combo)
+
+    def _add_row(self):
+        self.table.insertRow(self.table.rowCount())
+        row = self.table.rowCount() - 1
+        chk = QCheckBox(); chk.setChecked(True); chk.setStyleSheet("margin-left:6px;")
+        self.table.setCellWidget(row, 0, chk)
+        self.table.setItem(row, 1, QTableWidgetItem("New rule"))
+        self.table.setItem(row, 2, QTableWidgetItem(""))
+        combo = QComboBox(); combo.addItems(["critical", "warning", "info"])
+        combo.setStyleSheet("background:#16213e; color:#e0e0e0;")
+        self.table.setCellWidget(row, 3, combo)
+        self.table.editItem(self.table.item(row, 2))
+
+    def _del_row(self):
+        rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+
+    def _reset(self):
+        if QMessageBox.question(
+            self, "Reset rules",
+            "Replace all rules with the built-in defaults?",
+            QMessageBox.Yes | QMessageBox.No
+        ) == QMessageBox.Yes:
+            self.rules = [r.copy() for r in DEFAULT_RULES]
+            self._populate()
+
+    def _toggle_help(self, checked):
+        self.help_box.setVisible(checked)
+
+    def _test_expr(self):
+        expr = self.test_expr.text().strip()
+        if not expr:
+            return
+        ok, result = RulesEngine.test_expression(expr, self.sample_metrics)
+        if ok:
+            is_true = "True" in result
+            color = "#66BB6A" if is_true else "#EF5350"
+            self.test_result.setText(result)
+            self.test_result.setStyleSheet(f"color:{color}; font-weight:bold;")
+        else:
+            self.test_result.setText(f"Error: {result}")
+            self.test_result.setStyleSheet("color:#FF7043;")
+
+    def _save(self):
+        self.rules = []
+        for row in range(self.table.rowCount()):
+            chk   = self.table.cellWidget(row, 0)
+            name  = (self.table.item(row, 1) or QTableWidgetItem("")).text().strip()
+            expr  = (self.table.item(row, 2) or QTableWidgetItem("")).text().strip()
+            combo = self.table.cellWidget(row, 3)
+            if not expr:
+                continue
+            self.rules.append({
+                "name":       name or "Rule",
+                "expression": expr,
+                "level":      combo.currentText() if combo else "warning",
+                "enabled":    chk.isChecked() if chk else True,
+                "icon":       "⚠",
+                "detail":     "",
+            })
         self.accept()
 
 
@@ -483,6 +931,8 @@ class DiagnosticsWidget(QWidget):
         super().__init__()
         self.case_config = CaseConfig()
         self.all_cases: List[str] = []
+        self._current_case: Optional[str] = None
+        self._current_metrics: dict = {}
         self._init_ui()
         self.refresh_cases()
 
@@ -520,15 +970,28 @@ class DiagnosticsWidget(QWidget):
         self.cfg_btn.setEnabled(False)
         ll.addWidget(self.cfg_btn)
 
-        QPushButton_refresh = QPushButton("↻  Refresh List")
-        QPushButton_refresh.clicked.connect(self.refresh_cases)
-        ll.addWidget(QPushButton_refresh)
+        self.rules_btn = QPushButton("📋  Edit Rules")
+        self.rules_btn.clicked.connect(self._open_rules)
+        self.rules_btn.setEnabled(False)
+        ll.addWidget(self.rules_btn)
+
+        btn_refresh = QPushButton("↻  Refresh List")
+        btn_refresh.clicked.connect(self.refresh_cases)
+        ll.addWidget(btn_refresh)
         layout.addWidget(left)
 
         # ── Right panel ───────────────────────────────────────────────
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(6, 6, 6, 6)
+
+        # File info — shows exactly which file is loaded
+        self.file_label = QLabel("No case selected")
+        self.file_label.setStyleSheet(
+            "color:#666; font-size:10px; padding:2px 4px; "
+            "background:#0d0d1a; border-bottom:1px solid #222;"
+        )
+        rl.addWidget(self.file_label)
 
         self.findings_box = QTextEdit()
         self.findings_box.setReadOnly(True)
@@ -576,20 +1039,48 @@ class DiagnosticsWidget(QWidget):
     def _on_select(self, item):
         if item is None:
             self.cfg_btn.setEnabled(False)
+            self.rules_btn.setEnabled(False)
             return
         self.cfg_btn.setEnabled(True)
+        self.rules_btn.setEnabled(True)
         self._show(item.text())
 
     def _show(self, case_id: str):
+        self._current_case = case_id
         self.findings_box.setPlainText(f"Loading {case_id}…")
+        self.file_label.setText(f"Loading {case_id}…")
 
         modules = load_case_data(case_id)
         if not modules:
             self.findings_box.setPlainText(f"No downloaded data found for {case_id}.")
+            self.file_label.setText(f"No data found for {case_id}")
             return
 
-        config   = self.case_config.get(case_id)
-        findings = run_diagnostics(modules, config)
+        # Show which file is loaded
+        meta = modules.get("_meta", {})
+        n_files = meta.get("all_files", 1)
+        fname   = meta.get("file", "unknown")
+        self.file_label.setText(
+            f"📄  {fname}"
+            + (f"   ({n_files} file(s) in folder — showing latest)" if n_files > 1 else "")
+        )
+
+        config = self.case_config.get(case_id)
+        rules  = self.case_config.get_rules(case_id)
+
+        # Compute sample metrics from first module (for rules testing)
+        mod_names = [k for k in modules if k != "_meta"]
+        if mod_names:
+            first = modules[mod_names[0]]
+            self._current_metrics = compute_metrics(
+                first.get("sensor_data", pd.DataFrame()),
+                first.get("sensor_event", pd.DataFrame()),
+                config,
+            )
+        else:
+            self._current_metrics = {}
+
+        findings = run_diagnostics(modules, config, rules)
 
         # Findings text + border colour
         self.findings_box.setPlainText("\n".join(f["msg"] for f in findings))
@@ -621,4 +1112,16 @@ class DiagnosticsWidget(QWidget):
         dlg = CaseConfigDialog(case_id, self.case_config.get(case_id), self)
         if dlg.exec_() == QDialog.Accepted:
             self.case_config.set(case_id, dlg.result_config)
+            self._show(case_id)
+
+    # ── Rules editor ─────────────────────────────────────────────────
+
+    def _open_rules(self):
+        if not self._current_case:
+            return
+        case_id = self._current_case
+        rules   = self.case_config.get_rules(case_id)
+        dlg = RulesDialog(case_id, rules, self._current_metrics, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.case_config.set_rules(case_id, dlg.rules)
             self._show(case_id)

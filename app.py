@@ -98,13 +98,22 @@ class DownloadWorker(QObject):
 
     # ---- token refresh ----
     def _ensure_token(self):
-        """Auto-refresh the token if needed."""
+        """Auto-refresh the token. Raises if RTA is expired."""
         new = refresh_token(self.rta)
         if new:
             self.token = new
-            # persist for next run
             TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
             TOKEN_FILE.write_text(new)
+            self.progress.emit("  OK  Token refreshed")
+        else:
+            raise RuntimeError(
+                "RTA token has expired.\n\n"
+                "Get a new one from the browser:\n"
+                "  1. Open mc.us.oneconnect.net\n"
+                "  2. F12 → Console\n"
+                "  3. Run: localStorage.getItem('RTA')\n"
+                "  4. Click 'Update Token' in the app and paste it"
+            )
 
     # ---- asset lookup ----
     def _find_asset(self, serial: str) -> Optional[dict]:
