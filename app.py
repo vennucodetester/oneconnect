@@ -17,10 +17,12 @@ from typing import List, Dict, Optional
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QLabel,
-    QProgressBar, QMessageBox, QInputDialog, QSpinBox
+    QProgressBar, QMessageBox, QInputDialog, QSpinBox, QTabWidget
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
+
+from diagnostics import DiagnosticsWidget
 
 
 # ---------------------------------------------------------------------------
@@ -308,11 +310,16 @@ class OneConnectApp(QMainWindow):
     # ---- UI setup ----
     def _init_ui(self):
         self.setWindowTitle("OneConnect Data Downloader")
-        self.setGeometry(100, 100, 900, 750)
+        self.setGeometry(100, 100, 1100, 800)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        # Tab container
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        # ── Tab 1: Download ───────────────────────────────────────────
+        download_tab = QWidget()
+        self.tabs.addTab(download_tab, "📥  Download")
+        layout = QVBoxLayout(download_tab)
 
         # Title
         title = QLabel("OneConnect Graph Data Download")
@@ -392,6 +399,18 @@ class OneConnectApp(QMainWindow):
         self.status_text = QTextEdit()
         self.status_text.setReadOnly(True)
         layout.addWidget(self.status_text)
+
+        # ── Tab 2: Diagnostics ────────────────────────────────────────
+        self.diag_widget = DiagnosticsWidget()
+        self.tabs.addTab(self.diag_widget, "🔍  Diagnostics")
+
+        # Refresh diagnostics case list after a download completes
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_changed(self, index):
+        """Refresh the case list when switching to Diagnostics tab."""
+        if index == 1:
+            self.diag_widget.refresh_cases()
 
     # ---- credentials ----
     def _load_credentials(self):
