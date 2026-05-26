@@ -17,10 +17,16 @@ from typing import List, Dict, Optional
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QLabel,
-    QProgressBar, QMessageBox, QInputDialog, QSpinBox, QTabWidget
+    QProgressBar, QMessageBox, QInputDialog, QSpinBox, QTabWidget,
+    QDialog, QLineEdit, QDialogButtonBox, QTextBrowser
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
+try:
+    from PyQt5.QtWidgets import QApplication
+    _clipboard = QApplication.clipboard
+except:
+    _clipboard = None
 
 from diagnostics import DiagnosticsWidget
 
@@ -76,6 +82,105 @@ def get_headers(token: str) -> dict:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
+
+# ---------------------------------------------------------------------------
+#  Custom token input dialog
+# ---------------------------------------------------------------------------
+
+class TokenInputDialog(QDialog):
+    """Dialog to get RTA token from user with clear instructions and copy button."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Enter Refresh Token")
+        self.setFixedWidth(500)
+        self.token = None
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+
+        # Instructions
+        instr = QLabel(
+            "Your RTA token has expired. Get a fresh one:\n\n"
+            "1. Go to: mc.us.oneconnect.net\n"
+            "2. Press F12 to open DevTools\n"
+            "3. Click the Console tab\n"
+            "4. Copy and paste this command:"
+        )
+        instr.setStyleSheet("font-size:11px; line-height:1.6;")
+        layout.addWidget(instr)
+
+        # Command box (highlighted, selectable, easy to copy)
+        cmd_box = QTextEdit()
+        cmd_box.setPlainText("localStorage.getItem('RTA')")
+        cmd_box.setReadOnly(True)
+        cmd_box.setMaximumHeight(50)
+        cmd_box.setStyleSheet(
+            "QTextEdit { background:#2a2a4e; color:#42A5F5; font-family:Consolas,monospace; "
+            "font-size:13px; padding:8px; border:1px solid #42A5F5; border-radius:4px; }"
+        )
+        layout.addWidget(cmd_box)
+
+        # Copy button
+        btn_copy = QPushButton("Copy command to clipboard")
+        btn_copy.setFixedHeight(32)
+        btn_copy.setStyleSheet(
+            "QPushButton { background:#42A5F5; color:#fff; font-weight:bold; "
+            "border:none; border-radius:4px; }"
+            "QPushButton:hover { background:#64B5F6; }"
+        )
+        btn_copy.clicked.connect(lambda: self._copy_to_clipboard("localStorage.getItem('RTA')"))
+        layout.addWidget(btn_copy)
+
+        layout.addSpacing(10)
+
+        # Paste result
+        paste_label = QLabel("5. Paste the result here:")
+        paste_label.setStyleSheet("font-size:11px; font-weight:bold;")
+        layout.addWidget(paste_label)
+
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Paste your RTA token here (long string starting with 5c227...)")
+        self.input.setEchoMode(QLineEdit.Password)  # Hide for privacy
+        self.input.setMinimumHeight(40)
+        layout.addWidget(self.input)
+
+        # Help text
+        help_text = QLabel(
+            "The token looks like:  5c227fcf-369b-451d-b5ad-537c4d745a32\n"
+            "This only needs to be done once."
+        )
+        help_text.setStyleSheet("font-size:10px; color:#888;")
+        layout.addWidget(help_text)
+
+        # Dialog buttons
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _copy_to_clipboard(self, text: str):
+        """Copy text to system clipboard."""
+        try:
+            # Get clipboard from QApplication
+            app = QApplication.instance()
+            if app:
+                cb = app.clipboard()
+                cb.setText(text)
+                # Visual feedback
+                self.input.setPlaceholderText("✓ Command copied to clipboard — paste it in the browser console")
+        except Exception:
+            pass
+
+    def _accept(self):
+        """Validate and accept."""
+        token = self.input.text().strip()
+        if len(token) < 10:
+            QMessageBox.warning(self, "Invalid", "Please paste the token from the browser console.")
+            return
+        self.token = token
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +498,11 @@ class OneConnectApp(QMainWindow):
         self.token_btn.clicked.connect(self._ask_rta)
         dl_row.addWidget(self.token_btn)
 
+        self.ref_btn = QPushButton("? Quick Ref")
+        self.ref_btn.setStyleSheet("font-size: 10px;")
+        self.ref_btn.clicked.connect(self._show_quick_ref)
+        dl_row.addWidget(self.ref_btn)
+
         layout.addLayout(dl_row)
 
         # Progress
@@ -446,22 +556,10 @@ class OneConnectApp(QMainWindow):
             self._ask_rta()
 
     def _ask_rta(self):
-        """Ask user for their Refresh Token (RTA)."""
-        msg = (
-            "To get your Refresh Token (one-time setup):\n\n"
-            "1. Open https://mc.us.oneconnect.net in your browser\n"
-            "2. Press F12 (open DevTools)\n"
-            "3. Click the Console tab\n"
-            "4. Type this and press Enter:\n"
-            "       localStorage.getItem('RTA')\n"
-            "5. Copy the value shown (looks like: 5c227fcf-369b-...)\n\n"
-            "This only needs to be done once. The app will auto-refresh\n"
-            "your session token using this."
-        )
-        rta, ok = QInputDialog.getText(self, "Enter Refresh Token (RTA)", msg)
-
-        if ok and rta and len(rta.strip()) > 10:
-            self.rta = rta.strip()
+        """Ask user for their Refresh Token (RTA) with custom dialog."""
+        dlg = TokenInputDialog(self)
+        if dlg.exec_() == QDialog.Accepted and dlg.token:
+            self.rta = dlg.token
             RTA_FILE.parent.mkdir(parents=True, exist_ok=True)
             RTA_FILE.write_text(self.rta)
 
@@ -526,6 +624,56 @@ class OneConnectApp(QMainWindow):
     def _clear_cases(self):
         self.table.setRowCount(0)
         self._log("Cleared all cases")
+
+    # ---- quick reference ----
+    def _show_quick_ref(self):
+        """Show all browser console commands user might need."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Quick Reference - Browser Console Commands")
+        dlg.setFixedSize(600, 400)
+
+        layout = QVBoxLayout(dlg)
+
+        text_area = QTextBrowser()
+        text_area.setHtml("""
+<html><body style="background:#1a1a2e; color:#e0e0e0; font-family:Consolas,monospace; font-size:11px; padding:10px;">
+<h2 style="color:#42A5F5;">Browser Console Commands</h2>
+<p>Copy &amp; paste these into your browser's <b>Console tab</b> (F12 → Console).</p>
+
+<h3 style="color:#FFA726;">Get RTA Token (One-Time Setup)</h3>
+<p style="background:#16213e; padding:8px; border-radius:4px; border-left:3px solid #42A5F5;">
+<code>localStorage.getItem('RTA')</code>
+</p>
+<p><b>When:</b> First time using the app, or when "Update Token" asks for it<br/>
+<b>Result:</b> Token like <code>5c227fcf-369b-...</code></p>
+
+<h3 style="color:#FFA726;">Check Current Bearer Token</h3>
+<p style="background:#16213e; padding:8px; border-radius:4px; border-left:3px solid #42A5F5;">
+<code>localStorage.getItem('TOKEN')</code>
+</p>
+<p><b>When:</b> If you need to verify the app's current session token</p>
+
+<h3 style="color:#FFA726;">Check All Auth Values</h3>
+<p style="background:#16213e; padding:8px; border-radius:4px; border-left:3px solid #42A5F5;">
+<code>console.table(Object.keys(localStorage).filter(k => k.includes('TOKEN') || k.includes('RTA')))</code>
+</p>
+<p><b>When:</b> To see all auth data in storage</p>
+
+<hr style="border-color:#333;"/>
+<p style="color:#999; font-size:10px;">Copy each command, paste into Console, press Enter.</p>
+</body></html>
+""")
+        text_area.setStyleSheet(
+            "QTextBrowser { background:#1a1a2e; color:#e0e0e0; "
+            "font-family:Consolas,monospace; font-size:11px; }"
+        )
+        layout.addWidget(text_area)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec_()
 
     # ---- download ----
     def _start_download(self):
