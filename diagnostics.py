@@ -32,8 +32,10 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
-DATA_DIR = Path("C:\\Users\\silam\\OneC\\downloads")
-CONFIG_FILE = Path("C:\\Users\\silam\\OneC\\case_config.json")
+# Paths — works on any laptop/username
+_APP_DIR = Path.home() / "OneC"
+DATA_DIR = _APP_DIR / "downloads"
+CONFIG_FILE = _APP_DIR / "case_config.json"
 
 DEFAULT_CONFIGS = {
     "LT": {

@@ -37,9 +37,12 @@ from diagnostics import DiagnosticsWidget
 BASE_URL = "https://api.us.oneconnect.net/oneconnect-api"
 PROJECT_ID = 136        # Hussmann OneConnect
 TENANT_ID = 37          # Dollar General
-DATA_DIR = Path("C:\\Users\\silam\\OneC\\downloads")
-TOKEN_FILE = Path("C:\\Users\\silam\\OneC\\token.txt")
-RTA_FILE = Path("C:\\Users\\silam\\OneC\\rta.txt")
+
+# Paths — works on any laptop/username
+_APP_DIR = Path.home() / "OneC"
+DATA_DIR = _APP_DIR / "downloads"
+TOKEN_FILE = _APP_DIR / "token.txt"
+RTA_FILE = _APP_DIR / "rta.txt"
 
 # Microblock telemetry attributes
 # sensor-data = numeric (temperatures), sensor-event = boolean (status flags)
