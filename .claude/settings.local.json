@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(where tesseract:*)",
+      "Bash(python -m playwright install chromium)",
+      "Bash(python oneconnect_scraper.py)",
+      "Bash(python -c ':*)",
+      "Bash(python probe_timeseries.py)",
+      "Bash(python probe_timeseries2.py)",
+      "Bash(python probe_timeseries3.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('C:/Users/silam/OneC/oneconnect_scraper.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "mcp__Claude_in_Chrome__switch_browser",
+      "mcp__Control_Chrome__open_url",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "mcp__Claude_in_Chrome__list_connected_browsers",
+      "mcp__Claude_in_Chrome__browser_batch",
+      "mcp__Claude_in_Chrome__javascript_tool",
+      "Bash(python -c ' *)",
+      "mcp__Claude_in_Chrome__tabs_create_mcp",
+      "mcp__Claude_in_Chrome__read_page",
+      "mcp__Claude_in_Chrome__read_network_requests"
+    ]
+  }
+}
