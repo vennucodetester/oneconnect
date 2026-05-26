@@ -1,0 +1,12 @@
+{
+  "cases": {
+    "MY26C019885": {
+      "case_type": "MT",
+      "setpoint": 34.0,
+      "defrost_terminate_threshold": 35.0,
+      "defrost_frequency": 4,
+      "sync_tolerance_min": 30,
+      "door_rise_per_15min": 5.0
+    }
+  }
+}

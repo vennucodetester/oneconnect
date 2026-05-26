@@ -361,6 +361,9 @@ class DownloadWorker(QObject):
 
                             if len(df) > 0:
                                 sheet = f"{mod_name}_{svc_label}"
+                                # Excel sheet names cannot contain \ / * [ ] : ?
+                                import re
+                                sheet = re.sub(r'[\\\\/*\[\]:?]', '-', sheet)
                                 # Excel sheet names max 31 chars
                                 if len(sheet) > 31:
                                     sheet = sheet[:31]

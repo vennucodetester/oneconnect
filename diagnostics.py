@@ -514,19 +514,6 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
         df_d  = data.get("sensor_data",  pd.DataFrame())
         df_e  = data.get("sensor_event", pd.DataFrame())
 
-        # Compressor background
-        for cp in detect_compressor_runs(df_e):
-            if cp["on"]:
-                fig.add_vrect(x0=cp["start"], x1=cp["end"],
-                              fillcolor="rgba(100,200,100,0.07)",
-                              line_width=0, row=ri, col=1)
-
-        # Defrost shading
-        for p in detect_defrost_periods(df_d, threshold):
-            color = "rgba(255,210,50,0.20)" if p["terminated_ok"] else "rgba(255,70,50,0.25)"
-            fig.add_vrect(x0=p["start"], x1=p["end"],
-                          fillcolor=color, line_width=0, row=ri, col=1)
-
         if not df_d.empty:
             ts = df_d["timestamp"]
 
@@ -576,6 +563,13 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Comp. Discharge: %{y:.1f}°F<extra></extra>",
                 ), row=ri, col=1, secondary_y=True)
 
+        # Defrost shading
+        for p in detect_defrost_periods(df_d, threshold):
+            color = "rgba(255,210,50,0.30)" if p["terminated_ok"] else "rgba(255,70,50,0.35)"
+            fig.add_vrect(x0=p["start"].strftime("%Y-%m-%d %H:%M:%S"), 
+                          x1=p["end"].strftime("%Y-%m-%d %H:%M:%S"),
+                          fillcolor=color, line_width=0, layer="below", row=ri, col=1)
+
         # Alarm markers
         alarm_times = get_alarm_times(df_e)
         if alarm_times:
@@ -614,7 +608,22 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
     fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.07)",
                      tickformat="%m/%d\n%H:%M")
 
-    return fig.to_html(include_plotlyjs="cdn", full_html=True)
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+
+    # Inject a polyfill for insertRule to avoid crashes on old PyQtWebEngine Chromium
+    polyfill = """
+    <script>
+    var originalInsertRule = CSSStyleSheet.prototype.insertRule;
+    CSSStyleSheet.prototype.insertRule = function(rule, index) {
+        try {
+            return originalInsertRule.call(this, rule, index || 0);
+        } catch (e) {
+            return -1;
+        }
+    };
+    </script>
+    """
+    return html.replace("<head>", f"<head>\\n{polyfill}")
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +639,14 @@ class CaseConfigDialog(QDialog):
         self._build(config)
 
     def _build(self, cfg):
+        self.setStyleSheet("""
+            QDialog { background: #1a1a2e; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; }
+            QPushButton { background: #2a2a4e; color: #e0e0e0; border: 1px solid #42A5F5; border-radius: 4px; padding: 4px 12px; }
+            QPushButton:hover { background: #3a3a6e; }
+            QComboBox { background: #16213e; color: #e0e0e0; border: 1px solid #555; padding: 2px; }
+            QDoubleSpinBox, QSpinBox { background: #16213e; color: #e0e0e0; border: 1px solid #555; padding: 2px; }
+        """)
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
@@ -749,6 +766,15 @@ class RulesDialog(QDialog):
         self._build()
 
     def _build(self):
+        self.setStyleSheet("""
+            QDialog { background: #1a1a2e; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; }
+            QCheckBox { color: #e0e0e0; }
+            QPushButton { background: #2a2a4e; color: #e0e0e0; border: 1px solid #42A5F5; border-radius: 4px; padding: 4px 12px; }
+            QPushButton:hover { background: #3a3a6e; }
+            QLineEdit { background: #16213e; color: #e0e0e0; border: 1px solid #555; padding: 4px; }
+            QTextEdit { background: #0d0d1a; color: #aaa; border: 1px solid #333; }
+        """)
         layout = QVBoxLayout(self)
 
         # Header
@@ -770,8 +796,8 @@ class RulesDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet(
-            "QTableWidget { background:#16213e; color:#e0e0e0; gridline-color:#333; }"
-            "QHeaderView::section { background:#1a1a2e; color:#42A5F5; border:none; padding:4px; }"
+            "QTableWidget { background:#16213e; alternate-background-color:#1e2640; color:#e0e0e0; gridline-color:#333; border: 1px solid #333; }"
+            "QHeaderView::section { background:#1a1a2e; color:#42A5F5; border:1px solid #333; padding:4px; }"
             "QTableWidget::item:selected { background:#42A5F5; color:#000; }"
         )
         layout.addWidget(self.table)
@@ -965,17 +991,32 @@ class DiagnosticsWidget(QWidget):
         self.case_list.currentItemChanged.connect(self._on_select)
         ll.addWidget(self.case_list)
 
+        btn_style = """
+            QPushButton {
+                background: #2a2a4e; 
+                color: #e0e0e0; 
+                border: 1px solid #42A5F5; 
+                border-radius: 4px;
+                padding: 6px;
+            }
+            QPushButton:hover { background: #3a3a6e; }
+            QPushButton:disabled { background: #1a1a2e; color: #555; border-color: #333; }
+        """
+
         self.cfg_btn = QPushButton("⚙  Configure Case")
+        self.cfg_btn.setStyleSheet(btn_style)
         self.cfg_btn.clicked.connect(self._open_config)
         self.cfg_btn.setEnabled(False)
         ll.addWidget(self.cfg_btn)
 
         self.rules_btn = QPushButton("📋  Edit Rules")
+        self.rules_btn.setStyleSheet(btn_style)
         self.rules_btn.clicked.connect(self._open_rules)
         self.rules_btn.setEnabled(False)
         ll.addWidget(self.rules_btn)
 
         btn_refresh = QPushButton("↻  Refresh List")
+        btn_refresh.setStyleSheet(btn_style)
         btn_refresh.clicked.connect(self.refresh_cases)
         ll.addWidget(btn_refresh)
         layout.addWidget(left)
@@ -987,6 +1028,7 @@ class DiagnosticsWidget(QWidget):
 
         # File info — shows exactly which file is loaded
         self.file_label = QLabel("No case selected")
+        self.file_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self.file_label.setStyleSheet(
             "color:#666; font-size:10px; padding:2px 4px; "
             "background:#0d0d1a; border-bottom:1px solid #222;"
