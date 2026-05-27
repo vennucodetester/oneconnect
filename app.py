@@ -338,13 +338,23 @@ class DownloadWorker(QObject):
             params = {"assetId": asset_id, "location": "ASSET", "target": "TENANT"}
             resp = requests.get(url, headers=get_headers(self.token),
                                 params=params, timeout=15)
+            self.progress.emit(
+                f"    Dashboard config: HTTP {resp.status_code}"
+            )
             if resp.status_code == 200:
-                uuids = self._extract_uuids(resp.json())
+                body = resp.json()
+                # Log a compact preview so we can see what the response looks like
+                preview = json.dumps(body)[:400]
+                self.progress.emit(f"    Response preview: {preview}")
+                uuids = self._extract_uuids(body)
+                self.progress.emit(f"    UUIDs found: {uuids}")
                 # Deduplicate while preserving order
                 seen = set()
                 return [u for u in uuids if not (u in seen or seen.add(u))]
-        except Exception:
-            pass
+            else:
+                self.progress.emit(f"    Response: {resp.text[:200]}")
+        except Exception as e:
+            self.progress.emit(f"    Dashboard lookup error: {e}")
         return []
 
     # ---- extract metadata from asset response ----
@@ -645,6 +655,12 @@ class DownloadWorker(QObject):
                             for uid in reversed(_dash_uuids_cache):
                                 if uid not in candidates:
                                     candidates.insert(0, uid)
+
+                        # Debug: show full module dict when externalId is not a UUID
+                        if not self._is_uuid(mod_ext_id):
+                            self.progress.emit(
+                                f"    Module fields: {json.dumps(module)}"
+                            )
 
                         self.progress.emit(
                             f"  Module {m_idx}/{len(modules)}: {mod_name}"
