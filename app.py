@@ -24,6 +24,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
 
 from diagnostics import DiagnosticsWidget
+from data_cruncher import DataCruncherWidget
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +754,10 @@ class OneConnectApp(QMainWindow):
         # == Tab 2: Diagnostics ================================================
         self.diag_widget = DiagnosticsWidget()
         self.tabs.addTab(self.diag_widget, "Diagnostics")
+
+        # == Tab 3: Data Cruncher =============================================
+        self.cruncher_widget = DataCruncherWidget()
+        self.tabs.addTab(self.cruncher_widget, "Data Cruncher")
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
