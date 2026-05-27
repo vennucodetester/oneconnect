@@ -61,7 +61,8 @@ DEFAULT_CONFIGS = {
 #  Variables available in expressions:
 #    setpoint, threshold, door_rate
 #    defrost_count, defrost_failed_count, defrost_failed_pct
-#    alarm_count
+#    avg_defrost_min, max_defrost_min
+#    alarm_count  (if Alarm column present)
 #    temp_rise_15min   (max °F rise in any 15-min window)
 #    post_defrost_floor_drift  (+ means getting warmer after each defrost)
 #    high_temp_hours   (hours temp was above setpoint + 8°F)
@@ -103,12 +104,12 @@ DEFAULT_RULES = [
         "detail": "Temp above setpoint+8°F for high_temp_hours:.1f hours",
     },
     {
-        "name": "Active alarms",
-        "expression": "alarm_count > 0",
-        "level": "critical",
+        "name": "Long defrost cycles",
+        "expression": "avg_defrost_min >= 45",
+        "level": "warning",
         "enabled": True,
-        "icon": "🚨",
-        "detail": "alarm_count alarm event(s) in this period",
+        "icon": "⏱",
+        "detail": "Avg defrost duration avg_defrost_min:.0f min (max max_defrost_min:.0f min)",
     },
 ]
 
@@ -170,8 +171,15 @@ def get_downloaded_cases() -> List[str]:
         return []
     cases = set()
     for f in DATA_DIR.glob("*.xlsx"):
-        if not f.name.startswith("~"):
-            m = re.match(r"^([A-Z0-9]+)_\d{8}_\d{6}\.xlsx$", f.name)
+        if f.name.startswith("~") or f.name.startswith("_"):
+            continue
+        # New format: MY26C019878.xlsx  (no timestamp)
+        stem = f.stem
+        if re.match(r'^[A-Z0-9]+$', stem):
+            cases.add(stem)
+        else:
+            # Legacy format: MY26C019878_20260526_143000.xlsx
+            m = re.match(r"^([A-Z0-9]+)_\d{8}_\d{6}$", stem)
             if m:
                 cases.add(m.group(1))
     return sorted(cases)
@@ -180,37 +188,47 @@ def get_downloaded_cases() -> List[str]:
 def load_case_data(case_id: str) -> Optional[Dict]:
     """
     Returns {
-        "_meta": {"file": filename, "downloaded": mtime, "all_files": N},
+        "_meta": {"file": filename, "downloaded": mtime},
         module_name: {"sensor_data": df, "sensor_event": df},
+        "Store_ambient": {"sensor_data": df},   (if present)
         ...
     }
-    Always picks the most recently downloaded file.
+    Looks for {case_id}.xlsx first (new format), falls back to legacy timestamped files.
     """
-    files = sorted(DATA_DIR.glob(f"{case_id}_*.xlsx"), reverse=True)
-    if not files:
-        return None
-    latest = files[0]
+    # Try new format first
+    target = DATA_DIR / f"{case_id}.xlsx"
+    if not target.exists():
+        # Fall back to legacy timestamped format
+        legacy = sorted(DATA_DIR.glob(f"{case_id}_*.xlsx"), reverse=True)
+        if legacy:
+            target = legacy[0]
+        else:
+            return None
+
     try:
-        xl = pd.ExcelFile(latest)
+        xl = pd.ExcelFile(target)
         modules: Dict = {
             "_meta": {
-                "file": latest.name,
-                "downloaded": latest.stat().st_mtime,
-                "all_files": len(files),
+                "file": target.name,
+                "downloaded": target.stat().st_mtime,
             }
         }
         for sheet in xl.sheet_names:
-            df = pd.read_excel(latest, sheet_name=sheet)
+            df = pd.read_excel(target, sheet_name=sheet)
             if "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 df = df.sort_values("timestamp").reset_index(drop=True)
-            if "_sensor-data" in sheet:
+
+            if sheet == "Store_ambient":
+                modules["Store_ambient"] = {"sensor_data": df}
+            elif "_sensor-data" in sheet:
                 mod = sheet.split("_sensor-data")[0]
                 modules.setdefault(mod, {})["sensor_data"] = df
             elif "_sensor-event" in sheet:
                 mod = sheet.split("_sensor-event")[0]
                 modules.setdefault(mod, {})["sensor_event"] = df
-        data_keys = [k for k in modules if k != "_meta"]
+
+        data_keys = [k for k in modules if k not in ("_meta", "Store_ambient")]
         return modules if data_keys else None
     except Exception as e:
         print(f"Error loading {case_id}: {e}")
@@ -221,29 +239,68 @@ def load_case_data(case_id: str) -> Optional[Dict]:
 #  Detection helpers
 # ---------------------------------------------------------------------------
 
-def detect_defrost_periods(df: pd.DataFrame, threshold: float) -> List[dict]:
-    if df is None or df.empty or "Defrost Status" not in df.columns:
+def detect_defrost_periods(df_d: pd.DataFrame, df_e: pd.DataFrame,
+                           threshold: float) -> List[dict]:
+    """
+    Detect defrost periods using Defrost DO (sensor-event boolean) if available,
+    otherwise fall back to Defrost Status (sensor-data numeric > 0).
+    Cross-references sensor-data for max Defrost Terminate temp during each period.
+    """
+    # Determine which source has defrost on/off info
+    use_do = (df_e is not None and not df_e.empty and "Defrost DO" in df_e.columns)
+    use_status = (df_d is not None and not df_d.empty and "Defrost Status" in df_d.columns)
+
+    if not use_do and not use_status:
         return []
-    periods, in_def, start = [], False, None
-    for _, row in df.iterrows():
-        val = row.get("Defrost Status", 0)
-        is_def = pd.notna(val) and float(val) > 0
-        if is_def and not in_def:
-            in_def, start = True, row["timestamp"]
-        elif not is_def and in_def:
-            end = row["timestamp"]
-            in_def = False
-            mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
-            seg = df[mask]
-            max_t = seg["Defrost Terminate"].max() if "Defrost Terminate" in seg.columns else None
-            max_t_f = float(max_t) if max_t is not None and pd.notna(max_t) else None
-            periods.append({
-                "start": start, "end": end,
-                "max_terminate": max_t_f,
-                "terminated_ok": (max_t_f is not None and max_t_f >= threshold),
-                "duration_min": (end - start).total_seconds() / 60,
-            })
-    return periods
+
+    if use_do:
+        # Use Defrost DO (boolean, on-change events — more accurate)
+        src = df_e.dropna(subset=["Defrost DO"]).sort_values("timestamp").copy()
+        periods, in_def, start = [], False, None
+        for _, row in src.iterrows():
+            is_def = bool(row["Defrost DO"])
+            if is_def and not in_def:
+                in_def, start = True, row["timestamp"]
+            elif not is_def and in_def:
+                end = row["timestamp"]
+                in_def = False
+                # Look up max Defrost Terminate from sensor-data during this window
+                max_t_f = None
+                if df_d is not None and not df_d.empty and "Defrost Terminate" in df_d.columns:
+                    mask = (df_d["timestamp"] >= start) & (df_d["timestamp"] <= end)
+                    seg = df_d[mask]
+                    if not seg.empty:
+                        max_t = seg["Defrost Terminate"].max()
+                        max_t_f = float(max_t) if pd.notna(max_t) else None
+                periods.append({
+                    "start": start, "end": end,
+                    "max_terminate": max_t_f,
+                    "terminated_ok": (max_t_f is not None and max_t_f >= threshold),
+                    "duration_min": (end - start).total_seconds() / 60,
+                })
+        return periods
+    else:
+        # Fall back to Defrost Status (numeric, sampled every 60s)
+        periods, in_def, start = [], False, None
+        for _, row in df_d.iterrows():
+            val = row.get("Defrost Status", 0)
+            is_def = pd.notna(val) and float(val) > 0
+            if is_def and not in_def:
+                in_def, start = True, row["timestamp"]
+            elif not is_def and in_def:
+                end = row["timestamp"]
+                in_def = False
+                mask = (df_d["timestamp"] >= start) & (df_d["timestamp"] <= end)
+                seg = df_d[mask]
+                max_t = seg["Defrost Terminate"].max() if "Defrost Terminate" in seg.columns else None
+                max_t_f = float(max_t) if max_t is not None and pd.notna(max_t) else None
+                periods.append({
+                    "start": start, "end": end,
+                    "max_terminate": max_t_f,
+                    "terminated_ok": (max_t_f is not None and max_t_f >= threshold),
+                    "duration_min": (end - start).total_seconds() / 60,
+                })
+        return periods
 
 
 def detect_compressor_runs(df_event: pd.DataFrame) -> List[dict]:
@@ -264,6 +321,7 @@ def detect_compressor_runs(df_event: pd.DataFrame) -> List[dict]:
 
 
 def get_alarm_times(df_event: pd.DataFrame) -> list:
+    """Get alarm timestamps. Returns empty list if Alarm column not present (removed from downloads)."""
     if df_event is None or df_event.empty or "Alarm" not in df_event.columns:
         return []
     return list(df_event.loc[df_event["Alarm"] == True, "timestamp"])
@@ -301,14 +359,22 @@ def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame, config: dict) -> dic
         "min_temp":                   0.0,
     }
 
-    # Defrost stats
-    periods = detect_defrost_periods(df_d, threshold)
+    # Defrost stats (now uses Defrost DO from sensor-event if available)
+    periods = detect_defrost_periods(df_d, df_e, threshold)
     m["defrost_count"] = len(periods)
     bad = [p for p in periods if not p["terminated_ok"]]
     m["defrost_failed_count"] = len(bad)
     m["defrost_failed_pct"] = (len(bad) / len(periods) * 100) if periods else 0.0
 
-    # Alarms
+    # Average defrost duration (minutes)
+    if periods:
+        m["avg_defrost_min"] = sum(p["duration_min"] for p in periods) / len(periods)
+        m["max_defrost_min"] = max(p["duration_min"] for p in periods)
+    else:
+        m["avg_defrost_min"] = 0.0
+        m["max_defrost_min"] = 0.0
+
+    # Alarms (graceful — Alarm column may not exist in new downloads)
     m["alarm_count"] = len(get_alarm_times(df_e))
 
     if not df_d.empty and "Control Temperature" in df_d.columns:
@@ -462,12 +528,16 @@ def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> Li
                     "msg":    f"{icon} [{mod_name}] {rule['name']}: {detail}",
                 })
 
-    # Defrost sync check (only when 2 modules present)
+    # Defrost sync check (only when 2+ modules present)
     sync_tol = config.get("sync_tolerance_min", 30)
     if len(mod_names) == 2:
         a, b = mod_names
-        pa = detect_defrost_periods(modules[a].get("sensor_data", pd.DataFrame()), threshold)
-        pb = detect_defrost_periods(modules[b].get("sensor_data", pd.DataFrame()), threshold)
+        pa = detect_defrost_periods(
+            modules[a].get("sensor_data", pd.DataFrame()),
+            modules[a].get("sensor_event", pd.DataFrame()), threshold)
+        pb = detect_defrost_periods(
+            modules[b].get("sensor_data", pd.DataFrame()),
+            modules[b].get("sensor_event", pd.DataFrame()), threshold)
         if pa and pb:
             starts_b = [p["start"] for p in pb]
             max_gap = 0.0
@@ -495,17 +565,19 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
     setpoint  = config.get("setpoint", -10.0)
     threshold = config.get("defrost_terminate_threshold", 35.0)
     case_type = config.get("case_type", "LT")
-    mod_names = [k for k in modules.keys() if k != "_meta"]
-    n = len(mod_names)
-    if n == 0:
+    mod_names = [k for k in modules.keys() if k not in ("_meta", "Store_ambient")]
+    has_ambient = "Store_ambient" in modules
+    n = len(mod_names) + (1 if has_ambient else 0)
+    if len(mod_names) == 0:
         return "<html><body style='background:#1a1a2e;color:#aaa'><p>No data</p></body></html>"
 
+    titles = mod_names + (["Store Ambient"] if has_ambient else [])
     specs = [[{"secondary_y": True}]] * n
     fig = make_subplots(
         rows=n, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.07,
-        subplot_titles=mod_names,
+        subplot_titles=titles,
         specs=specs,
     )
 
@@ -565,8 +637,32 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Comp. Discharge: %{y:.1f}°F<extra></extra>",
                 ), row=ri, col=1, secondary_y=True)
 
+        # Digital output traces (from sensor-event) — shown on secondary axis as 0/1
+        if not df_e.empty:
+            ts_e = df_e["timestamp"]
+
+            # Defrost DO
+            if "Defrost DO" in df_e.columns:
+                fig.add_trace(go.Scatter(
+                    x=ts_e, y=df_e["Defrost DO"].astype(float),
+                    name=f"{mod_name} — Defrost DO", mode="lines",
+                    line=dict(color="#FFD54F", width=1.5),
+                    opacity=0.6, visible="legendonly",
+                    hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Defrost DO: %{y}<extra></extra>",
+                ), row=ri, col=1, secondary_y=True)
+
+            # Cond Fan DO
+            if "Cond Fan DO" in df_e.columns:
+                fig.add_trace(go.Scatter(
+                    x=ts_e, y=df_e["Cond Fan DO"].astype(float),
+                    name=f"{mod_name} — Cond Fan DO", mode="lines",
+                    line=dict(color="#AB47BC", width=1.5),
+                    opacity=0.6, visible="legendonly",
+                    hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Cond Fan DO: %{y}<extra></extra>",
+                ), row=ri, col=1, secondary_y=True)
+
         # Defrost shading
-        for p in detect_defrost_periods(df_d, threshold):
+        for p in detect_defrost_periods(df_d, df_e, threshold):
             color = "rgba(255,210,50,0.30)" if p["terminated_ok"] else "rgba(255,70,50,0.35)"
             fig.add_vrect(x0=p["start"].strftime("%Y-%m-%d %H:%M:%S"), 
                           x1=p["end"].strftime("%Y-%m-%d %H:%M:%S"),
@@ -589,8 +685,40 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
 
         fig.update_yaxes(title_text="Temp (°F)", row=ri, col=1, secondary_y=False,
                          showgrid=True, gridcolor="rgba(255,255,255,0.07)")
-        fig.update_yaxes(title_text="Comp. Disch. (°F)", row=ri, col=1, secondary_y=True,
-                         showgrid=False, range=[50, 250])
+        fig.update_yaxes(title_text="DO / Disch.", row=ri, col=1, secondary_y=True,
+                         showgrid=False)
+
+    # ── Store Ambient subplot ──
+    if has_ambient:
+        amb_row = len(mod_names) + 1
+        amb_df = modules["Store_ambient"].get("sensor_data", pd.DataFrame())
+        if not amb_df.empty and "timestamp" in amb_df.columns:
+            ts_a = amb_df["timestamp"]
+            if "Temperature" in amb_df.columns:
+                fig.add_trace(go.Scatter(
+                    x=ts_a, y=amb_df["Temperature"],
+                    name="Store Temp", mode="lines",
+                    line=dict(color="#66BB6A", width=2),
+                    hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Store Temp: %{y:.1f}°F<extra></extra>",
+                ), row=amb_row, col=1, secondary_y=False)
+            if "Humidity" in amb_df.columns:
+                fig.add_trace(go.Scatter(
+                    x=ts_a, y=amb_df["Humidity"],
+                    name="Store RH%", mode="lines",
+                    line=dict(color="#29B6F6", width=1.5, dash="dot"),
+                    hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>RH: %{y:.1f}%<extra></extra>",
+                ), row=amb_row, col=1, secondary_y=True)
+            if "Dewpoint" in amb_df.columns:
+                fig.add_trace(go.Scatter(
+                    x=ts_a, y=amb_df["Dewpoint"],
+                    name="Dewpoint", mode="lines",
+                    line=dict(color="#78909C", width=1.5, dash="dash"),
+                    hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Dewpoint: %{y:.1f}°F<extra></extra>",
+                ), row=amb_row, col=1, secondary_y=False)
+            fig.update_yaxes(title_text="Temp (°F)", row=amb_row, col=1, secondary_y=False,
+                             showgrid=True, gridcolor="rgba(255,255,255,0.07)")
+            fig.update_yaxes(title_text="RH %", row=amb_row, col=1, secondary_y=True,
+                             showgrid=False)
 
     fig.update_layout(
         title=dict(
@@ -732,9 +860,11 @@ Available variables you can use in expressions:
 
   defrost_count        Total defrosts detected
   defrost_failed_count Defrosts that didn't reach threshold
-  defrost_failed_pct   % that failed (0–100)
+  defrost_failed_pct   % that failed (0-100)
+  avg_defrost_min      Average defrost duration (minutes)
+  max_defrost_min      Longest single defrost (minutes)
 
-  alarm_count          Number of alarm events
+  alarm_count          Number of alarm events (if available)
 
   temp_rise_15min      Max temp rise in any 15-min window (°F)
   high_temp_hours      Hours temp was above setpoint + 8°F
