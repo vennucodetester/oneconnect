@@ -88,15 +88,15 @@ DEFAULT_RULES = [
         "level": "warning",
         "enabled": True,
         "icon": "📈",
-        "detail": "Post-defrost temp floor rising +post_defrost_floor_drift:.1f°F",
+        "detail": "Post-defrost temp floor rising +post_defrost_floor_drift:.1f°F per defrost cycle",
     },
     {
-        "name": "Door left open",
+        "name": "Possible door left open",
         "expression": "temp_rise_15min >= door_rate",
-        "level": "critical",
+        "level": "warning",
         "enabled": True,
         "icon": "🚪",
-        "detail": "Temp rose temp_rise_15min:.1f°F in 15 min",
+        "detail": "Temp rose temp_rise_15min:.1f°F in 15 min (outside defrost periods)",
     },
     {
         "name": "Air leak / warm load",
@@ -113,6 +113,14 @@ DEFAULT_RULES = [
         "enabled": True,
         "icon": "⏱",
         "detail": "Avg defrost duration avg_defrost_min:.0f min (max max_defrost_min:.0f min)",
+    },
+    {
+        "name": "High store humidity",
+        "expression": "store_rh_max >= 70",
+        "level": "warning",
+        "enabled": True,
+        "icon": "💧",
+        "detail": "Store RH peaked at store_rh_max:.0f% (avg store_rh_avg:.0f%) — ice load risk",
     },
 ]
 
@@ -334,17 +342,19 @@ def get_alarm_times(df_event: pd.DataFrame) -> list:
 #  Metrics computation  (feeds the rules engine)
 # ---------------------------------------------------------------------------
 
-def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame, config: dict) -> dict:
+def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame,
+                    config: dict, df_ambient: pd.DataFrame = None) -> dict:
     """
     Compute all numeric variables that can be referenced in rule expressions.
     Returns a flat dict of floats/ints.
+
+    df_ambient: optional store ambient dataframe (Temperature, Humidity, Dewpoint)
     """
     threshold = config.get("defrost_terminate_threshold", 35.0)
     setpoint  = config.get("setpoint", -10.0)
     door_rate = config.get("door_rise_per_15min", 5.0)
 
     m = {
-        # Config values (also available in expressions)
         "setpoint":   setpoint,
         "threshold":  threshold,
         "door_rate":  door_rate,
@@ -352,30 +362,32 @@ def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame, config: dict) -> dic
         "defrost_count":        0,
         "defrost_failed_count": 0,
         "defrost_failed_pct":   0.0,
+        "avg_defrost_min":      0.0,
+        "max_defrost_min":      0.0,
         # Alarms
         "alarm_count":          0,
         # Temperature behavior
-        "temp_rise_15min":            0.0,
-        "post_defrost_floor_drift":   0.0,
-        "high_temp_hours":            0.0,
-        "max_temp":                   0.0,
-        "min_temp":                   0.0,
+        "temp_rise_15min":          0.0,   # max rise OUTSIDE defrost periods
+        "post_defrost_floor_drift": 0.0,
+        "high_temp_hours":          0.0,
+        "max_temp":                 0.0,
+        "min_temp":                 0.0,
+        # Store ambient (None = no data available; rules referencing these silently skip)
+        "store_rh_avg":   None,
+        "store_rh_max":   None,
+        "store_temp_avg": None,
     }
 
-    # Defrost stats (now uses Defrost DO from sensor-event if available)
+    # Defrost stats (uses Defrost DO from sensor-event if available)
     periods = detect_defrost_periods(df_d, df_e, threshold)
     m["defrost_count"] = len(periods)
     bad = [p for p in periods if not p["terminated_ok"]]
     m["defrost_failed_count"] = len(bad)
     m["defrost_failed_pct"] = (len(bad) / len(periods) * 100) if periods else 0.0
 
-    # Average defrost duration (minutes)
     if periods:
         m["avg_defrost_min"] = sum(p["duration_min"] for p in periods) / len(periods)
         m["max_defrost_min"] = max(p["duration_min"] for p in periods)
-    else:
-        m["avg_defrost_min"] = 0.0
-        m["max_defrost_min"] = 0.0
 
     # Alarms (graceful — Alarm column may not exist in new downloads)
     m["alarm_count"] = len(get_alarm_times(df_e))
@@ -385,21 +397,43 @@ def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame, config: dict) -> dic
         m["max_temp"] = float(df_s["Control Temperature"].max())
         m["min_temp"] = float(df_s["Control Temperature"].min())
 
-        # Max temp rise in any 15-min block
-        df_s["_block"] = ((df_s["timestamp"] - df_s["timestamp"].iloc[0])
-                          .dt.total_seconds() // 900).astype(int)
-        block_avg = df_s.groupby("_block")["Control Temperature"].mean()
-        rises = block_avg.diff()
-        m["temp_rise_15min"] = float(rises.max()) if not rises.empty and pd.notna(rises.max()) else 0.0
+        # ── Build defrost-exclusion mask ──────────────────────────────────────
+        # Exclude defrost start → end + 45-min recovery from door-open and
+        # high-temp calculations. This eliminates false positives from planned
+        # defrost temperature spikes.
+        excl = pd.Series(False, index=df_s.index)
+        for p in periods:
+            mask = (
+                (df_s["timestamp"] >= p["start"]) &
+                (df_s["timestamp"] <= p["end"] + pd.Timedelta(minutes=45))
+            )
+            excl |= mask
+        df_normal = df_s[~excl].copy()
 
-        # Hours above setpoint + 8
-        high = df_s[df_s["Control Temperature"] > setpoint + 8]
+        # ── Door-open detection: rolling 15-min rise, non-defrost periods only ─
+        if len(df_normal) > 10:
+            try:
+                temps = (df_normal.set_index("timestamp")["Control Temperature"]
+                         .dropna().sort_index())
+                # For each point: how much did temp rise vs the lowest point
+                # in the 15-min window behind it?
+                rolling_min = temps.rolling("15min", min_periods=3).min()
+                rises = temps - rolling_min
+                m["temp_rise_15min"] = (float(rises.max())
+                                        if pd.notna(rises.max()) else 0.0)
+            except Exception:
+                pass
+
+        # ── Hours above setpoint + 8°F (non-defrost periods) ─────────────────
+        df_chk = df_normal if len(df_normal) > 0 else df_s
+        high = df_chk[df_chk["Control Temperature"] > setpoint + 8]
         if len(high) > 1:
             m["high_temp_hours"] = float(
-                (high["timestamp"].max() - high["timestamp"].min()).total_seconds() / 3600
+                (high["timestamp"].max() - high["timestamp"].min())
+                .total_seconds() / 3600
             )
 
-        # Post-defrost floor drift (last post-defrost min vs first)
+        # ── Post-defrost floor drift ──────────────────────────────────────────
         floors = []
         for p in periods:
             w_end = p["end"] + pd.Timedelta(minutes=45)
@@ -408,6 +442,18 @@ def compute_metrics(df_d: pd.DataFrame, df_e: pd.DataFrame, config: dict) -> dic
                 floors.append(float(seg["Control Temperature"].min()))
         if len(floors) >= 2:
             m["post_defrost_floor_drift"] = floors[-1] - floors[0]
+
+    # ── Store ambient humidity / temperature ──────────────────────────────────
+    if df_ambient is not None and not df_ambient.empty:
+        if "Humidity" in df_ambient.columns:
+            rh = df_ambient["Humidity"].dropna()
+            if not rh.empty:
+                m["store_rh_avg"] = float(rh.mean())
+                m["store_rh_max"] = float(rh.max())
+        if "Temperature" in df_ambient.columns:
+            at = df_ambient["Temperature"].dropna()
+            if not at.empty:
+                m["store_temp_avg"] = float(at.mean())
 
     return m
 
@@ -578,7 +624,8 @@ def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> Li
         df_d = data.get("sensor_data",  pd.DataFrame())
         df_e = data.get("sensor_event", pd.DataFrame())
 
-        metrics = compute_metrics(df_d, df_e, config)
+        df_ambient = modules.get("Store_ambient", {}).get("sensor_data", None)
+        metrics = compute_metrics(df_d, df_e, config, df_ambient=df_ambient)
 
         # 1. Hardcoded Rules
         for rule in rules:
@@ -941,6 +988,11 @@ Available variables you can use in expressions:
                             Positive = getting warmer over time
 
   max_temp / min_temp  Highest / lowest Control Temp seen
+
+  store_rh_avg         Store RH% average (if ambient downloaded)
+  store_rh_max         Store RH% maximum (if ambient downloaded)
+  store_temp_avg       Store air temperature average (if ambient downloaded)
+  (Note: rules using store_* silently skip when no ambient data is available)
 
 Operators:   +  -  *  /  ( )
 Comparisons: >= <= > < == !=
@@ -1534,10 +1586,12 @@ class DiagnosticsWidget(QWidget):
         mod_names = [k for k in modules if k != "_meta"]
         if mod_names:
             first = modules[mod_names[0]]
+            ambient_data = modules.get("Store_ambient", {}).get("sensor_data", None)
             self._current_metrics = compute_metrics(
                 first.get("sensor_data", pd.DataFrame()),
                 first.get("sensor_event", pd.DataFrame()),
                 config,
+                df_ambient=ambient_data,
             )
         else:
             self._current_metrics = {}

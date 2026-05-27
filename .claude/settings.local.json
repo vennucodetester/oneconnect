@@ -29,7 +29,12 @@
       "Bash(python -c \"import diagnostics; print\\('imports OK'\\)\")",
       "Bash(python -c \"import app; print\\('App imports OK'\\); print\\('TokenInputDialog:', hasattr\\(app, 'TokenInputDialog'\\)\\)\")",
       "Bash(python -c \"import app; print\\('App OK'\\); print\\('TokenInputDialog:', hasattr\\(app.OneConnectApp, '_show_quick_ref'\\)\\)\")",
-      "mcp__Claude_in_Chrome__navigate"
+      "mcp__Claude_in_Chrome__navigate",
+      "Bash(git commit -m 'Fix WinError 32 file lock during merge *)",
+      "Bash(git commit -m 'Fix telemetry query for single-module assets with mismatched externalId *)",
+      "Bash(git commit -m 'Fix UUID lookup for single-module assets via dashboard config *)",
+      "Bash(git commit -m 'Add debug logging to diagnose dashboard UUID lookup failure *)",
+      "Bash(git commit *)"
     ]
   }
 }

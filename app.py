@@ -467,8 +467,15 @@ class DownloadWorker(QObject):
     def _download_store_ambient(self, store_num: str,
                                 start_dt: datetime,
                                 end_dt: datetime) -> Optional[pd.DataFrame]:
-        """Find the DG{store} rhsensor and download ambient data."""
-        serial = f"DG{store_num}"
+        """Find the DG{store} rhsensor and download ambient data.
+
+        Store numbers sometimes include a city suffix (e.g. '22930-FORESTBURG').
+        The RHsensor asset is named with only the numeric prefix (e.g. 'DG22930'),
+        so we strip any hyphen/space suffix before searching.
+        """
+        # Use only the numeric prefix — strip anything after hyphen or space
+        store_num_clean = re.split(r'[-\s]', store_num)[0]
+        serial = f"DG{store_num_clean}"
         self.progress.emit(f"    Looking up store sensor {serial}...")
 
         asset = self._find_asset(serial)
