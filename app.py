@@ -339,44 +339,55 @@ class DownloadWorker(QObject):
             })
 
         all_rows = []
-        page_from = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         page_num = 0
 
-        while True:
-            payload = {
-                "serviceType": service_type,
-                "aggregatedAttributes": agg_attrs,
-                "searchSpan": {
-                    "from": page_from,
-                    "to":   end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                },
-                "timeSeriesId": {"assetExternalId": external_id},
-                "withStep": True,
-                "pageSize": 2000,
-            }
+        # Chunk the total time range into 1-day windows so LTTB provides high density (1-min frequency)
+        chunk_days = 1
+        current_from = start_dt
+        
+        while current_from < end_dt:
+            current_to = min(current_from + timedelta(days=chunk_days), end_dt)
+            
+            page_from_str = current_from.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            
+            # Pagination within the chunk (rarely needed for 7 days, but safe)
+            while True:
+                payload = {
+                    "serviceType": service_type,
+                    "aggregatedAttributes": agg_attrs,
+                    "searchSpan": {
+                        "from": page_from_str,
+                        "to":   current_to.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                    },
+                    "timeSeriesId": {"assetExternalId": external_id},
+                    "withStep": True,
+                    "pageSize": 2000,
+                }
 
-            if "event" in service_type:
-                payload["lookupBeforeStart"] = True
-                payload["sortDirection"] = "ASC"
+                if "event" in service_type:
+                    payload["lookupBeforeStart"] = True
+                    payload["sortDirection"] = "ASC"
 
-            resp = requests.post(url, json=payload,
-                                 headers=get_headers(self.token), timeout=30)
-            resp.raise_for_status()
-            result = resp.json()
-            rows = result.get("data", [])
-            meta = result.get("meta", {})
+                resp = requests.post(url, json=payload,
+                                     headers=get_headers(self.token), timeout=30)
+                resp.raise_for_status()
+                result = resp.json()
+                rows = result.get("data", [])
+                meta = result.get("meta", {})
 
-            all_rows.extend(rows)
-            page_num += 1
+                all_rows.extend(rows)
+                page_num += 1
 
-            if meta.get("last", True) or not rows:
-                break
+                if meta.get("last", True) or not rows:
+                    break
 
-            next_token = meta.get("nextPageToken")
-            if not next_token:
-                break
-            page_from = next_token
-            self.progress.emit(f"      ... page {page_num + 1} ({len(all_rows)} rows so far)")
+                next_token = meta.get("nextPageToken")
+                if not next_token:
+                    break
+                page_from_str = next_token
+                self.progress.emit(f"      ... page {page_num + 1} ({len(all_rows)} rows so far)")
+            
+            current_from = current_to
 
         if not all_rows:
             return pd.DataFrame()
@@ -433,24 +444,27 @@ class DownloadWorker(QObject):
     def _merge_sheets(existing_file: Path, new_sheets: dict) -> dict:
         """Merge new data with existing Excel file, deduplicate by timestamp."""
         try:
-            xl = pd.ExcelFile(existing_file)
-            for sheet_name in xl.sheet_names:
+            # Use 'with' so the file handle is released before we rename over it
+            with pd.ExcelFile(existing_file) as xl:
+                sheet_names = xl.sheet_names
+                old_data = {}
+                for sheet_name in sheet_names:
+                    df = pd.read_excel(xl, sheet_name=sheet_name)
+                    if "timestamp" in df.columns:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    old_data[sheet_name] = df
+            # File handle is now closed — safe to merge and overwrite
+            for sheet_name, old_df in old_data.items():
                 if sheet_name in new_sheets:
-                    old_df = pd.read_excel(xl, sheet_name=sheet_name)
-                    if "timestamp" in old_df.columns:
-                        old_df["timestamp"] = pd.to_datetime(old_df["timestamp"])
-                    new_df = new_sheets[sheet_name]
-                    merged = pd.concat([old_df, new_df], ignore_index=True)
+                    merged = pd.concat([old_df, new_sheets[sheet_name]],
+                                       ignore_index=True)
                     if "timestamp" in merged.columns:
-                        merged = merged.drop_duplicates(
-                            subset=["timestamp"]).sort_values(
-                            "timestamp").reset_index(drop=True)
+                        merged = (merged.drop_duplicates(subset=["timestamp"])
+                                        .sort_values("timestamp")
+                                        .reset_index(drop=True))
                     new_sheets[sheet_name] = merged
                 else:
                     # Keep existing sheet that we didn't re-download
-                    old_df = pd.read_excel(xl, sheet_name=sheet_name)
-                    if "timestamp" in old_df.columns:
-                        old_df["timestamp"] = pd.to_datetime(old_df["timestamp"])
                     new_sheets[sheet_name] = old_df
         except Exception:
             pass  # If existing file is corrupt, just use new data
@@ -534,10 +548,11 @@ class DownloadWorker(QObject):
                     self.step_progress.emit(f"Getting modules for {case_id}...")
                     modules = self._get_modules(asset_id)
                     if not modules:
-                        self.progress.emit(
-                            f"  X No modules found for {case_id}")
-                        failed.append(case_id)
-                        continue
+                        # Fallback for single-module cases where the asset IS the module
+                        modules = [{
+                            "name": "Main",
+                            "externalId": asset.get("externalId") or asset.get("serialNumber") or case_id
+                        }]
 
                     mod_names = [m.get("name", f"Module_{i}")
                                  for i, m in enumerate(modules, 1)]
