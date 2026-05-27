@@ -343,9 +343,13 @@ class DownloadWorker(QObject):
             )
             if resp.status_code == 200:
                 body = resp.json()
-                # Log a compact preview so we can see what the response looks like
-                preview = json.dumps(body)[:400]
-                self.progress.emit(f"    Response preview: {preview}")
+                # Log full response in chunks so nothing is cut off
+                full = json.dumps(body, indent=None)
+                chunk = 800
+                for i in range(0, min(len(full), 4000), chunk):
+                    self.progress.emit(f"    [{i}] {full[i:i+chunk]}")
+                if len(full) > 4000:
+                    self.progress.emit(f"    ... (total {len(full)} chars)")
                 uuids = self._extract_uuids(body)
                 self.progress.emit(f"    UUIDs found: {uuids}")
                 # Deduplicate while preserving order
