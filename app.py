@@ -288,12 +288,64 @@ class DownloadWorker(QObject):
                 return asset
         return None
 
+    # ---- UUID detection ----
+    _UUID_RE = re.compile(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        re.IGNORECASE
+    )
+
+    @classmethod
+    def _is_uuid(cls, s: str) -> bool:
+        return bool(s and cls._UUID_RE.match(s))
+
+    @staticmethod
+    def _extract_uuids(obj, found=None) -> List[str]:
+        """Recursively extract all UUID-format strings from any JSON structure."""
+        if found is None:
+            found = []
+        uuid_re = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            re.IGNORECASE
+        )
+        if isinstance(obj, str):
+            if uuid_re.match(obj):
+                found.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                DownloadWorker._extract_uuids(v, found)
+        elif isinstance(obj, list):
+            for item in obj:
+                DownloadWorker._extract_uuids(item, found)
+        return found
+
     # ---- module discovery ----
     def _get_modules(self, asset_id: int) -> List[dict]:
         url = f"{BASE_URL}/tenants/{TENANT_ID}/tenant-api/asset-optimizer/v1/assets/{asset_id}"
         resp = requests.get(url, headers=get_headers(self.token), timeout=15)
         resp.raise_for_status()
         return resp.json().get("modulePlaceholders", [])
+
+    # ---- dashboard config lookup (finds UUID externalIds the portal uses) ----
+    def _get_dashboard_uuids(self, asset_id: int) -> List[str]:
+        """
+        Fetch the portal dashboard config for this asset and extract all
+        UUID-format strings. These are the externalIds the portal uses for
+        telemetry queries — the ground truth when module placeholders don't
+        have a UUID externalId.
+        """
+        try:
+            url = f"{BASE_URL}/tenants/{TENANT_ID}/asset-management/v1/dashboards"
+            params = {"assetId": asset_id, "location": "ASSET", "target": "TENANT"}
+            resp = requests.get(url, headers=get_headers(self.token),
+                                params=params, timeout=15)
+            if resp.status_code == 200:
+                uuids = self._extract_uuids(resp.json())
+                # Deduplicate while preserving order
+                seen = set()
+                return [u for u in uuids if not (u in seen or seen.add(u))]
+        except Exception:
+            pass
+        return []
 
     # ---- extract metadata from asset response ----
     @staticmethod
@@ -563,24 +615,36 @@ class DownloadWorker(QObject):
 
                     # Step 3: Download telemetry for each module
                     #
-                    # Build a list of externalId candidates to try.
-                    # For multi-module cases (Left / Center/Right) the module's own
-                    # externalId is always correct.
-                    # For single "Main" module cases the module externalId sometimes
-                    # doesn't match the telemetry store key — so we fall back to the
-                    # asset-level externalId and serialNumber as well.
+                    # The telemetry API key is a UUID stored in the module's externalId.
+                    # Multi-module cases (Left / Center/Right) always have UUID externalIds.
+                    # Single "Main" module cases often have the serialNumber instead of a
+                    # UUID — in that case we look up the dashboard config to find the real
+                    # UUID that the portal uses.
                     asset_ext_id = asset.get("externalId", "")
                     asset_serial  = asset.get("serialNumber", case_id)
+                    _dash_uuids_cache: Optional[List[str]] = None  # fetched lazily once
 
                     for m_idx, module in enumerate(modules, 1):
-                        mod_name = module.get("name", f"Module_{m_idx}")
+                        mod_name   = module.get("name", f"Module_{m_idx}")
                         mod_ext_id = module.get("externalId") or ""
 
-                        # Build candidate list: module id first, then asset-level ids
+                        # Start with the module's own externalId
                         candidates = []
                         for cid in [mod_ext_id, asset_ext_id, asset_serial, case_id]:
                             if cid and cid not in candidates:
                                 candidates.append(cid)
+
+                        # If the lead candidate is NOT a UUID, the telemetry store won't
+                        # match it. Look up the dashboard config to find the real UUIDs.
+                        if not self._is_uuid(candidates[0] if candidates else ""):
+                            if _dash_uuids_cache is None:
+                                self.progress.emit(
+                                    f"    Looking up dashboard config for UUIDs…")
+                                _dash_uuids_cache = self._get_dashboard_uuids(asset_id)
+                            # Prepend dashboard UUIDs — they're the most likely match
+                            for uid in reversed(_dash_uuids_cache):
+                                if uid not in candidates:
+                                    candidates.insert(0, uid)
 
                         self.progress.emit(
                             f"  Module {m_idx}/{len(modules)}: {mod_name}"
