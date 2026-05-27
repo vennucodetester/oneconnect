@@ -29,8 +29,11 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QAbstractItemView,
     QMessageBox, QScrollArea, QSizePolicy
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread
 from PyQt5.QtGui import QColor
+
+from data_cruncher import CacheBuilder, CATALOG_FILE, CACHE_FILE
+import json
 
 # Paths — works on any laptop/username
 _APP_DIR = Path.home() / "OneC"
@@ -173,13 +176,13 @@ def get_downloaded_cases() -> List[str]:
     for f in DATA_DIR.glob("*.xlsx"):
         if f.name.startswith("~") or f.name.startswith("_"):
             continue
-        # New format: MY26C019878.xlsx  (no timestamp)
+        # New format: MY26C019878.xlsx or MY25H061996-L.xlsx (no timestamp)
         stem = f.stem
-        if re.match(r'^[A-Z0-9]+$', stem):
+        if re.match(r'^[A-Z0-9][A-Z0-9-]*$', stem):
             cases.add(stem)
         else:
             # Legacy format: MY26C019878_20260526_143000.xlsx
-            m = re.match(r"^([A-Z0-9]+)_\d{8}_\d{6}$", stem)
+            m = re.match(r"^([A-Z0-9][A-Z0-9-]*)_\d{8}_\d{6}$", stem)
             if m:
                 cases.add(m.group(1))
     return sorted(cases)
@@ -680,7 +683,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                 fig.add_trace(go.Scatter(
                     x=ts, y=df_d["Control Temperature"],
                     name=f"{mod_name} — Control Temp", mode="lines",
-                    line=dict(color="#42A5F5", width=2.5),
+                    line=dict(color="#4CAF50", width=2.5, shape='hv'),  # Green matching original UI
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Control Temp: %{y:.1f}°F<extra></extra>",
                 ), row=ri, col=1, secondary_y=False)
 
@@ -689,7 +692,8 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                 fig.add_trace(go.Scatter(
                     x=ts, y=df_d["Defrost Terminate"],
                     name=f"{mod_name} — Defrost Term.", mode="lines",
-                    line=dict(color="#FFA726", width=1.5, dash="dot"), opacity=0.85,
+                    line=dict(color="#9C27B0", width=1.5, shape='hv'),  # Purple matching original UI
+                    opacity=0.85,
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Defrost Term.: %{y:.1f}°F<extra></extra>",
                 ), row=ri, col=1, secondary_y=False)
 
@@ -698,7 +702,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                 fig.add_trace(go.Scatter(
                     x=ts, y=df_d["Compressor Discharge Temp"],
                     name=f"{mod_name} — Comp. Discharge", mode="lines",
-                    line=dict(color="#EF5350", width=1.5, dash="longdash"),
+                    line=dict(color="#EF5350", width=1.5, dash="longdash", shape='hv'),
                     opacity=0.75, visible="legendonly",
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Comp. Discharge: %{y:.1f}°F<extra></extra>",
                 ), row=ri, col=1, secondary_y=True)
@@ -712,8 +716,8 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                 fig.add_trace(go.Scatter(
                     x=ts_e, y=df_e["Defrost DO"].astype(float),
                     name=f"{mod_name} — Defrost DO", mode="lines",
-                    line=dict(color="#FFD54F", width=1.5),
-                    opacity=0.6, visible="legendonly",
+                    line=dict(color="#E040FB", width=1.5, shape='hv'),  # Pink/light purple matching UI
+                    opacity=0.8, visible=True,
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Defrost DO: %{y}<extra></extra>",
                 ), row=ri, col=1, secondary_y=True)
 
@@ -722,7 +726,7 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
                 fig.add_trace(go.Scatter(
                     x=ts_e, y=df_e["Cond Fan DO"].astype(float),
                     name=f"{mod_name} — Cond Fan DO", mode="lines",
-                    line=dict(color="#AB47BC", width=1.5),
+                    line=dict(color="#AB47BC", width=1.5, shape='hv'),
                     opacity=0.6, visible="legendonly",
                     hovertemplate="<b>%{x|%m/%d %H:%M}</b><br>Cond Fan DO: %{y}<extra></extra>",
                 ), row=ri, col=1, secondary_y=True)
@@ -739,10 +743,9 @@ def build_chart_html(case_id: str, modules: Dict, config: dict) -> str:
         if alarm_times:
             fig.add_trace(go.Scatter(
                 x=alarm_times,
-                y=[None] * len(alarm_times),
+                y=[0] * len(alarm_times),  # Draw at 0 on secondary axis
                 mode="markers",
-                marker=dict(symbol="line-ns", size=30, color="red",
-                            line=dict(color="red", width=2)),
+                marker=dict(symbol="square", size=8, color="#03A9F4"),  # Light blue square
                 name="Alarm",
                 legendgroup="alarm",
                 showlegend=(ri == 1),
@@ -1147,6 +1150,89 @@ class RulesDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+#  Diagnostics Filter Dialog
+# ---------------------------------------------------------------------------
+
+class DiagnosticsFilterDialog(QDialog):
+    def __init__(self, catalog: dict, active_rules: list, current_filters: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Filter Cases")
+        self.setFixedWidth(400)
+        self.result_filters = current_filters.copy()
+        
+        self.catalog = catalog
+        self.active_rules = active_rules
+        
+        self._build()
+        
+    def _build(self):
+        self.setStyleSheet("""
+            QDialog { background: #1a1a2e; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; font-weight: bold; margin-top: 5px; }
+            QCheckBox { color: #e0e0e0; padding: 2px; }
+            QPushButton { background: #2a2a4e; color: #e0e0e0; border: 1px solid #42A5F5; border-radius: 4px; padding: 6px 12px; }
+            QPushButton:hover { background: #3a3a6e; }
+        """)
+        layout = QVBoxLayout(self)
+        
+        # Models
+        models = set()
+        for v in self.catalog.values():
+            m = v.get("model")
+            if m: models.add(m)
+        
+        layout.addWidget(QLabel("Filter by Model (Nomenclature):"))
+        self.model_checks = {}
+        for m in sorted(models):
+            chk = QCheckBox(m)
+            if "models" not in self.result_filters or m in self.result_filters.get("models", []):
+                chk.setChecked(True)
+            self.model_checks[m] = chk
+            layout.addWidget(chk)
+            
+        layout.addSpacing(15)
+        
+        # Problems (Rules)
+        layout.addWidget(QLabel("Filter by Specific Problems (Warnings):"))
+        self.rule_checks = {}
+        for r in self.active_rules:
+            if not r.get("enabled", True): continue
+            name = r.get("name", "Rule")
+            chk = QCheckBox(name)
+            if "problems" in self.result_filters and name in self.result_filters["problems"]:
+                chk.setChecked(True)
+            self.rule_checks[name] = chk
+            layout.addWidget(chk)
+            
+        layout.addSpacing(15)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._save)
+        btns.rejected.connect(self.reject)
+        
+        btn_row = QHBoxLayout()
+        clear_btn = QPushButton("Clear Filters")
+        clear_btn.clicked.connect(self._clear_all)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(btns)
+        layout.addLayout(btn_row)
+        
+    def _clear_all(self):
+        for chk in self.model_checks.values(): chk.setChecked(True)
+        for chk in self.rule_checks.values(): chk.setChecked(False)
+        
+    def _save(self):
+        sel_models = [m for m, chk in self.model_checks.items() if chk.isChecked()]
+        sel_problems = [r for r, chk in self.rule_checks.items() if chk.isChecked()]
+        
+        self.result_filters["models"] = sel_models
+        self.result_filters["problems"] = sel_problems
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 #  Main diagnostics widget
 # ---------------------------------------------------------------------------
 
@@ -1157,8 +1243,22 @@ class DiagnosticsWidget(QWidget):
         self.all_cases: List[str] = []
         self._current_case: Optional[str] = None
         self._current_metrics: dict = {}
+        
+        self.active_filters = {}
+        self._catalog = {}
+        self._cache_df = pd.DataFrame()
+        self._load_cache_data()
+        
         self._init_ui()
         self.refresh_cases()
+        
+    def _load_cache_data(self):
+        if CATALOG_FILE.exists():
+            try: self._catalog = json.loads(CATALOG_FILE.read_text())
+            except: pass
+        if CACHE_FILE.exists():
+            try: self._cache_df = pd.read_csv(CACHE_FILE)
+            except: pass
 
     def _init_ui(self):
         layout = QHBoxLayout(self)
@@ -1177,18 +1277,9 @@ class DiagnosticsWidget(QWidget):
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search…")
-        self.search.textChanged.connect(self._filter)
+        self.search.textChanged.connect(lambda t: self._filter(t))
         ll.addWidget(self.search)
-
-        self.case_list = QListWidget()
-        self.case_list.setStyleSheet("""
-            QListWidget { background:#16213e; color:#e0e0e0; border:none; }
-            QListWidget::item:selected { background:#42A5F5; color:#000; }
-            QListWidget::item:hover    { background:#2a2a4e; }
-        """)
-        self.case_list.currentItemChanged.connect(self._on_select)
-        ll.addWidget(self.case_list)
-
+        
         btn_style = """
             QPushButton {
                 background: #2a2a4e; 
@@ -1200,6 +1291,20 @@ class DiagnosticsWidget(QWidget):
             QPushButton:hover { background: #3a3a6e; }
             QPushButton:disabled { background: #1a1a2e; color: #555; border-color: #333; }
         """
+        
+        self.filter_opts_btn = QPushButton("🔍 Filter Options")
+        self.filter_opts_btn.setStyleSheet(btn_style)
+        self.filter_opts_btn.clicked.connect(self._open_filters)
+        ll.addWidget(self.filter_opts_btn)
+
+        self.case_list = QListWidget()
+        self.case_list.setStyleSheet("""
+            QListWidget { background:#16213e; color:#e0e0e0; border:none; }
+            QListWidget::item:selected { background:#42A5F5; color:#000; }
+            QListWidget::item:hover    { background:#2a2a4e; }
+        """)
+        self.case_list.currentItemChanged.connect(self._on_select)
+        ll.addWidget(self.case_list)
 
         self.cfg_btn = QPushButton("⚙  Configure Case")
         self.cfg_btn.setStyleSheet(btn_style)
@@ -1217,6 +1322,18 @@ class DiagnosticsWidget(QWidget):
         btn_refresh.setStyleSheet(btn_style)
         btn_refresh.clicked.connect(self.refresh_cases)
         ll.addWidget(btn_refresh)
+        
+        self.cache_warn_lbl = QLabel("⚠ Cache is out of date!")
+        self.cache_warn_lbl.setStyleSheet("color:#FFCA28; font-size:11px; font-weight:bold;")
+        self.cache_warn_lbl.hide()
+        ll.addWidget(self.cache_warn_lbl)
+        
+        self.rebuild_btn = QPushButton("Rebuild Cache Now")
+        self.rebuild_btn.setStyleSheet(btn_style)
+        self.rebuild_btn.clicked.connect(self._rebuild_cache)
+        self.rebuild_btn.hide()
+        ll.addWidget(self.rebuild_btn)
+        
         layout.addWidget(left)
 
         # ── Right panel ───────────────────────────────────────────────
@@ -1224,6 +1341,7 @@ class DiagnosticsWidget(QWidget):
         rl = QVBoxLayout(right)
         rl.setContentsMargins(6, 6, 6, 6)
 
+        top_row = QHBoxLayout()
         # File info — shows exactly which file is loaded
         self.file_label = QLabel("No case selected")
         self.file_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -1231,7 +1349,16 @@ class DiagnosticsWidget(QWidget):
             "color:#666; font-size:10px; padding:2px 4px; "
             "background:#0d0d1a; border-bottom:1px solid #222;"
         )
-        rl.addWidget(self.file_label)
+        top_row.addWidget(self.file_label)
+        top_row.addStretch()
+        
+        top_row.addWidget(QLabel("Time Range:"))
+        self.time_combo = QComboBox()
+        self.time_combo.addItems(["All Data", "Last 1 Day", "Last 2 Days", "Last 3 Days", "Last 7 Days", "Last 14 Days", "Last 30 Days", "Last 60 Days"])
+        self.time_combo.currentTextChanged.connect(self._on_time_changed)
+        top_row.addWidget(self.time_combo)
+        
+        rl.addLayout(top_row)
 
         self.findings_box = QTextEdit()
         self.findings_box.setReadOnly(True)
@@ -1262,9 +1389,40 @@ class DiagnosticsWidget(QWidget):
 
     # ── Case list ─────────────────────────────────────────────────────
 
+    def _check_cache_staleness(self):
+        cat_time = CATALOG_FILE.stat().st_mtime if CATALOG_FILE.exists() else 0
+        cache_time = CACHE_FILE.stat().st_mtime if CACHE_FILE.exists() else 0
+        if cat_time > cache_time + 10:
+            self.cache_warn_lbl.show()
+            self.rebuild_btn.show()
+        else:
+            self.cache_warn_lbl.hide()
+            self.rebuild_btn.hide()
+
+    def _rebuild_cache(self):
+        self.rebuild_btn.setEnabled(False)
+        self.rebuild_btn.setText("Rebuilding...")
+        self.cache_thread = CacheBuilder()
+        self.cache_thread.done.connect(self._on_cache_done)
+        self.cache_thread.start()
+        
+    def _on_cache_done(self, rows):
+        self.rebuild_btn.setEnabled(True)
+        self.rebuild_btn.setText("Rebuild Cache Now")
+        self._load_cache_data()
+        self.refresh_cases()
+
+    def _open_filters(self):
+        active_rules = self.case_config.get_rules(self.all_cases[0]) if self.all_cases else DEFAULT_RULES
+        dlg = DiagnosticsFilterDialog(self._catalog, active_rules, self.active_filters, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.active_filters = dlg.result_filters
+            self.refresh_cases()
+
     def refresh_cases(self):
         self.all_cases = get_downloaded_cases()
-        self._populate(self.all_cases)
+        self._filter(self.search.text())
+        self._check_cache_staleness()
 
     def _populate(self, cases):
         self.case_list.clear()
@@ -1272,7 +1430,36 @@ class DiagnosticsWidget(QWidget):
             self.case_list.addItem(QListWidgetItem(c))
 
     def _filter(self, text):
-        self._populate([c for c in self.all_cases if text.upper() in c])
+        text = text.upper()
+        cases = []
+        for c in self.all_cases:
+            if text and text not in c:
+                continue
+                
+            m_name = self._catalog.get(c, {}).get("model")
+            if "models" in self.active_filters and m_name not in self.active_filters["models"]:
+                continue
+                
+            if "problems" in self.active_filters and self.active_filters["problems"]:
+                c_rows = self._cache_df[self._cache_df["case_id"] == c] if not self._cache_df.empty else pd.DataFrame()
+                has_prob = False
+                rules = self.case_config.get_rules(c)
+                for _, r in c_rows.iterrows():
+                    m = r.to_dict()
+                    for rule_name in self.active_filters["problems"]:
+                        rule = next((x for x in rules if x["name"] == rule_name), None)
+                        if rule:
+                            if RulesEngine.evaluate(rule["expression"], m):
+                                has_prob = True
+                                break
+                    if has_prob: break
+                
+                if not has_prob:
+                    continue
+                    
+            cases.append(c)
+            
+        self._populate(cases)
 
     # ── Selection ─────────────────────────────────────────────────────
 
@@ -1285,6 +1472,22 @@ class DiagnosticsWidget(QWidget):
         self.rules_btn.setEnabled(True)
         self._show(item.text())
 
+    def _get_time_filter_days(self) -> Optional[int]:
+        t = self.time_combo.currentText()
+        if "All Data" in t: return None
+        if "1 Day" in t: return 1
+        if "2 Days" in t: return 2
+        if "3 Days" in t: return 3
+        if "7 Days" in t: return 7
+        if "14 Days" in t: return 14
+        if "30 Days" in t: return 30
+        if "60 Days" in t: return 60
+        return None
+
+    def _on_time_changed(self, text):
+        if self._current_case:
+            self._show(self._current_case)
+
     def _show(self, case_id: str):
         self._current_case = case_id
         self.findings_box.setPlainText(f"Loading {case_id}…")
@@ -1295,6 +1498,25 @@ class DiagnosticsWidget(QWidget):
             self.findings_box.setPlainText(f"No downloaded data found for {case_id}.")
             self.file_label.setText(f"No data found for {case_id}")
             return
+            
+        days = self._get_time_filter_days()
+        if days is not None:
+            max_ts = None
+            for mod, data in modules.items():
+                if mod == "_meta": continue
+                df = data.get("sensor_data")
+                if df is not None and not df.empty:
+                    ts = df["timestamp"].max()
+                    if max_ts is None or ts > max_ts: max_ts = ts
+                    
+            if max_ts is not None:
+                cutoff = max_ts - pd.Timedelta(days=days)
+                for mod, data in modules.items():
+                    if mod == "_meta": continue
+                    for key in ["sensor_data", "sensor_event"]:
+                        df = data.get(key)
+                        if df is not None and not df.empty:
+                            data[key] = df[df["timestamp"] >= cutoff]
 
         # Show which file is loaded
         meta = modules.get("_meta", {})
