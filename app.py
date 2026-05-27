@@ -562,16 +562,29 @@ class DownloadWorker(QObject):
                     all_sheets = {}
 
                     # Step 3: Download telemetry for each module
+                    #
+                    # Build a list of externalId candidates to try.
+                    # For multi-module cases (Left / Center/Right) the module's own
+                    # externalId is always correct.
+                    # For single "Main" module cases the module externalId sometimes
+                    # doesn't match the telemetry store key — so we fall back to the
+                    # asset-level externalId and serialNumber as well.
+                    asset_ext_id = asset.get("externalId", "")
+                    asset_serial  = asset.get("serialNumber", case_id)
+
                     for m_idx, module in enumerate(modules, 1):
                         mod_name = module.get("name", f"Module_{m_idx}")
-                        ext_id = module.get("externalId")
-                        if not ext_id:
-                            self.progress.emit(
-                                f"  X Module {mod_name} has no externalId")
-                            continue
+                        mod_ext_id = module.get("externalId") or ""
+
+                        # Build candidate list: module id first, then asset-level ids
+                        candidates = []
+                        for cid in [mod_ext_id, asset_ext_id, asset_serial, case_id]:
+                            if cid and cid not in candidates:
+                                candidates.append(cid)
 
                         self.progress.emit(
-                            f"  Module {m_idx}/{len(modules)}: {mod_name}")
+                            f"  Module {m_idx}/{len(modules)}: {mod_name}"
+                            f"  [id: {candidates[0]}]")
 
                         # Group attrs by service type
                         by_service: Dict[str, list] = {}
@@ -588,17 +601,26 @@ class DownloadWorker(QObject):
                                 f"    Querying {svc_label} "
                                 f"({len(attrs)} attributes)...")
 
-                            df = self._query_telemetry(
-                                ext_id, svc_type, attrs, start_dt, end_dt)
+                            df = pd.DataFrame()
+                            used_id = candidates[0]
+                            for cid in candidates:
+                                df = self._query_telemetry(
+                                    cid, svc_type, attrs, start_dt, end_dt)
+                                if len(df) > 0:
+                                    used_id = cid
+                                    break
 
                             if len(df) > 0:
                                 sheet = f"{mod_name}_{svc_label}"
                                 all_sheets[sheet] = df
+                                note = (f"  (via {used_id})"
+                                        if used_id != candidates[0] else "")
                                 self.progress.emit(
-                                    f"    OK  {len(df)} rows")
+                                    f"    OK  {len(df)} rows{note}")
                             else:
                                 self.progress.emit(
-                                    f"    --  No {svc_label} data")
+                                    f"    --  No {svc_label} data"
+                                    f"  [tried: {', '.join(candidates)}]")
 
                     # Step 4: Download store ambient
                     if meta["store"]:
