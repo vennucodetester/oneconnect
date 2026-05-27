@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QLabel,
     QProgressBar, QMessageBox, QInputDialog, QSpinBox, QTabWidget,
-    QDialog, QLineEdit, QDialogButtonBox, QTextBrowser, QCheckBox
+    QDialog, QLineEdit, QDialogButtonBox, QTextBrowser, QCheckBox, QComboBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
@@ -198,6 +198,40 @@ class TokenInputDialog(QDialog):
         self.token = token
         self.accept()
 
+
+# ---------------------------------------------------------------------------
+#  Model Fetcher Worker
+# ---------------------------------------------------------------------------
+
+class FetchModelsWorker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, token: str, rta: str):
+        super().__init__()
+        self.token = token
+        self.rta = rta
+
+    def run(self):
+        try:
+            url = f"{BASE_URL}/tenants/{TENANT_ID}/tenant-api/asset-optimizer/v1/assets?pageNumber=0&pageSize=2000"
+            resp = requests.get(url, headers=get_headers(self.token), timeout=20)
+            resp.raise_for_status()
+            
+            result = resp.json()
+            assets = result.get("data", []) if isinstance(result, dict) else result
+            if not assets and isinstance(result, dict) and "content" in result:
+                assets = result.get("content", [])
+
+            models = {}
+            for a in assets:
+                m_name = a.get("model", {}).get("name", "Unknown")
+                serial = a.get("serialNumber", str(a.get("id")))
+                models.setdefault(m_name, []).append(serial)
+
+            self.finished.emit(models)
+        except Exception as e:
+            self.error.emit(str(e))
 
 # ---------------------------------------------------------------------------
 #  Download Worker (runs in background thread)
@@ -695,6 +729,24 @@ class OneConnectApp(QMainWindow):
         btn_row.addWidget(self.days_spin)
 
         layout.addLayout(btn_row)
+        
+        # Bulk add by Nomenclature
+        model_row = QHBoxLayout()
+        self.fetch_models_btn = QPushButton("Fetch Available Models")
+        self.fetch_models_btn.clicked.connect(self._fetch_models)
+        model_row.addWidget(self.fetch_models_btn)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(200)
+        model_row.addWidget(self.model_combo)
+
+        self.add_model_btn = QPushButton("Add All Cases")
+        self.add_model_btn.clicked.connect(self._add_model_cases)
+        self.add_model_btn.setEnabled(False)
+        model_row.addWidget(self.add_model_btn)
+        
+        model_row.addStretch()
+        layout.addLayout(model_row)
 
         # Info label
         info = QLabel(
@@ -857,6 +909,58 @@ class OneConnectApp(QMainWindow):
     def _clear_cases(self):
         self.table.setRowCount(0)
         self._log("Cleared all cases")
+
+    # ---- bulk model selection ----
+    def _fetch_models(self):
+        if not self.token:
+            self._ask_rta()
+            if not self.token:
+                return
+
+        self.fetch_models_btn.setEnabled(False)
+        self.fetch_models_btn.setText("Fetching...")
+        
+        self.fetch_thread = QThread()
+        self.fetch_worker = FetchModelsWorker(self.token, self.rta)
+        self.fetch_worker.moveToThread(self.fetch_thread)
+        self.fetch_thread.started.connect(self.fetch_worker.run)
+        self.fetch_worker.finished.connect(self._on_models_fetched)
+        self.fetch_worker.error.connect(self._on_models_error)
+        self.fetch_worker.finished.connect(self.fetch_thread.quit)
+        self.fetch_worker.error.connect(self.fetch_thread.quit)
+        self.fetch_worker.finished.connect(self.fetch_worker.deleteLater)
+        self.fetch_thread.finished.connect(self.fetch_thread.deleteLater)
+        self.fetch_thread.start()
+
+    def _on_models_error(self, err: str):
+        self.fetch_models_btn.setEnabled(True)
+        self.fetch_models_btn.setText("Fetch Available Models")
+        QMessageBox.warning(self, "Error", f"Could not fetch models: {err}")
+
+    def _on_models_fetched(self, models: dict):
+        self.fetch_models_btn.setEnabled(True)
+        self.fetch_models_btn.setText("Fetch Available Models")
+        self._models_cache = models
+        
+        self.model_combo.clear()
+        for m_name, serials in sorted(models.items()):
+            self.model_combo.addItem(f"{m_name} ({len(serials)} units)", m_name)
+            
+        if self.model_combo.count() > 0:
+            self.add_model_btn.setEnabled(True)
+            self._log(f"OK  Fetched {len(models)} models from API.")
+        else:
+            self._log("Warning: No models found.")
+
+    def _add_model_cases(self):
+        if not hasattr(self, '_models_cache') or not self._models_cache:
+            return
+            
+        m_name = self.model_combo.currentData()
+        if m_name and m_name in self._models_cache:
+            serials = self._models_cache[m_name]
+            self.input_text.setPlainText("\n".join(serials))
+            self._add_case_ids()
 
     # ---- quick reference ----
     def _show_quick_ref(self):

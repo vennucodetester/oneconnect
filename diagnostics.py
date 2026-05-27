@@ -497,8 +497,59 @@ def _format_detail(template: str, metrics: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Diagnostics engine  (uses rules)
 # ---------------------------------------------------------------------------
+#  Diagnostics engine  (uses rules and fleet context)
+# ---------------------------------------------------------------------------
+
+def _evaluate_fleet_context(mod_name: str, metrics: dict, fleet_df: pd.DataFrame) -> List[dict]:
+    """Compare a module's metrics against the fleet cache and return context findings."""
+    if fleet_df.empty:
+        return []
+        
+    context_findings = []
+    
+    # Define which metrics to check and whether "high" or "low" is bad
+    checks = [
+        ("avg_defrost_min", "Avg Defrost Duration", "min", "high"),
+        ("defrost_failed_pct", "Defrost Failure Rate", "%", "high"),
+        ("setpoint_deviation", "Setpoint Deviation", "°F", "high"),
+        ("avg_hours_between_defrosts", "Defrost Frequency", "hrs", "low"), 
+        ("temp_stability_std", "Temp Stability", "°F", "high")
+    ]
+    
+    for col, label, unit, direction in checks:
+        if col not in metrics or metrics[col] is None or col not in fleet_df.columns:
+            continue
+            
+        val = metrics[col]
+        fleet_vals = pd.to_numeric(fleet_df[col], errors="coerce").dropna()
+        if len(fleet_vals) < 5:
+            continue
+            
+        median = float(fleet_vals.median())
+        
+        if direction == "high":
+            # Check if in top 10% worst
+            thr = float(fleet_vals.quantile(0.90))
+            if val > thr and val > median * 1.2: # Also must be 20% worse than median to avoid noise
+                context_findings.append({
+                    "level": "warning",
+                    "type": "context",
+                    "module": mod_name,
+                    "msg": f"📈 [{mod_name}] Context: {label} is {val:.1f} {unit} (Top 10% worst in fleet. Fleet median: {median:.1f} {unit})",
+                })
+        elif direction == "low":
+            # Check if in bottom 10% worst
+            thr = float(fleet_vals.quantile(0.10))
+            if val < thr and val < median * 0.8:
+                context_findings.append({
+                    "level": "warning",
+                    "type": "context",
+                    "module": mod_name,
+                    "msg": f"📉 [{mod_name}] Context: {label} is {val:.1f} {unit} (Bottom 10% in fleet. Fleet median: {median:.1f} {unit})",
+                })
+                
+    return context_findings
 
 def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> List[dict]:
     if rules is None:
@@ -508,6 +559,17 @@ def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> Li
     mod_names = [k for k in modules.keys() if k != "_meta"]
     threshold = config.get("defrost_terminate_threshold", 35.0)
 
+    import os
+    from pathlib import Path
+    
+    fleet_df = pd.DataFrame()
+    cache_path = Path.home() / "OneC" / "downloads" / "_metrics_cache.csv"
+    if cache_path.exists():
+        try:
+            fleet_df = pd.read_csv(cache_path)
+        except Exception:
+            pass
+
     for mod_name in mod_names:
         data = modules[mod_name]
         df_d = data.get("sensor_data",  pd.DataFrame())
@@ -515,6 +577,7 @@ def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> Li
 
         metrics = compute_metrics(df_d, df_e, config)
 
+        # 1. Hardcoded Rules
         for rule in rules:
             if not rule.get("enabled", True):
                 continue
@@ -527,6 +590,9 @@ def run_diagnostics(modules: Dict, config: dict, rules: List[dict] = None) -> Li
                     "module": mod_name,
                     "msg":    f"{icon} [{mod_name}] {rule['name']}: {detail}",
                 })
+                
+        # 2. Fleet Context Analytics
+        findings.extend(_evaluate_fleet_context(mod_name, metrics, fleet_df))
 
     # Defrost sync check (only when 2+ modules present)
     sync_tol = config.get("sync_tolerance_min", 30)

@@ -28,7 +28,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py syntax OK'\\)\")",
       "Bash(python -c \"import diagnostics; print\\('imports OK'\\)\")",
       "Bash(python -c \"import app; print\\('App imports OK'\\); print\\('TokenInputDialog:', hasattr\\(app, 'TokenInputDialog'\\)\\)\")",
-      "Bash(python -c \"import app; print\\('App OK'\\); print\\('TokenInputDialog:', hasattr\\(app.OneConnectApp, '_show_quick_ref'\\)\\)\")"
+      "Bash(python -c \"import app; print\\('App OK'\\); print\\('TokenInputDialog:', hasattr\\(app.OneConnectApp, '_show_quick_ref'\\)\\)\")",
+      "mcp__Claude_in_Chrome__navigate"
     ]
   }
 }
