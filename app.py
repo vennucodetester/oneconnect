@@ -298,26 +298,6 @@ class DownloadWorker(QObject):
     def _is_uuid(cls, s: str) -> bool:
         return bool(s and cls._UUID_RE.match(s))
 
-    @staticmethod
-    def _extract_uuids(obj, found=None) -> List[str]:
-        """Recursively extract all UUID-format strings from any JSON structure."""
-        if found is None:
-            found = []
-        uuid_re = re.compile(
-            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-            re.IGNORECASE
-        )
-        if isinstance(obj, str):
-            if uuid_re.match(obj):
-                found.append(obj)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                DownloadWorker._extract_uuids(v, found)
-        elif isinstance(obj, list):
-            for item in obj:
-                DownloadWorker._extract_uuids(item, found)
-        return found
-
     # ---- module discovery ----
     def _get_modules(self, asset_id: int) -> List[dict]:
         url = f"{BASE_URL}/tenants/{TENANT_ID}/tenant-api/asset-optimizer/v1/assets/{asset_id}"
@@ -325,41 +305,59 @@ class DownloadWorker(QObject):
         resp.raise_for_status()
         return resp.json().get("modulePlaceholders", [])
 
-    # ---- dashboard config lookup (finds UUID externalIds the portal uses) ----
-    def _get_dashboard_uuids(self, asset_id: int) -> List[str]:
+    # ---- dashboard config: extract service types and attribute names ----
+    def _get_dashboard_attrs(self, asset_id: int) -> dict:
         """
-        Fetch the portal dashboard config for this asset and extract all
-        UUID-format strings. These are the externalIds the portal uses for
-        telemetry queries — the ground truth when module placeholders don't
-        have a UUID externalId.
+        Parse the portal dashboard config for this asset.
+
+        Different device families use different service type strings:
+          Standard Microblock:  Microblock-sensor-data / Microblock-sensor-event
+          Carel iJ (older):     Microblock-Cases-sensor-data / Microblock-Cases-sensor-event
+
+        The dashboard widgets declare exactly which service type and attribute
+        names the portal uses — so we parse them to build the correct query.
+
+        Returns:
+          {
+            "data_type":   "Microblock-Cases-sensor-data",  # or None
+            "event_type":  "Microblock-Cases-sensor-event", # or None
+            "data_attrs":  ["Control Temperature", "Defrost Status", ...],
+            "event_attrs": ["Refrigeration DO", "Defrost DO", ...],
+          }
         """
+        result = {"data_type": None, "event_type": None,
+                  "data_attrs": [], "event_attrs": []}
         try:
             url = f"{BASE_URL}/tenants/{TENANT_ID}/asset-management/v1/dashboards"
             params = {"assetId": asset_id, "location": "ASSET", "target": "TENANT"}
             resp = requests.get(url, headers=get_headers(self.token),
                                 params=params, timeout=15)
-            self.progress.emit(
-                f"    Dashboard config: HTTP {resp.status_code}"
-            )
-            if resp.status_code == 200:
-                body = resp.json()
-                # Log full response in chunks so nothing is cut off
-                full = json.dumps(body, indent=None)
-                chunk = 800
-                for i in range(0, min(len(full), 4000), chunk):
-                    self.progress.emit(f"    [{i}] {full[i:i+chunk]}")
-                if len(full) > 4000:
-                    self.progress.emit(f"    ... (total {len(full)} chars)")
-                uuids = self._extract_uuids(body)
-                self.progress.emit(f"    UUIDs found: {uuids}")
-                # Deduplicate while preserving order
-                seen = set()
-                return [u for u in uuids if not (u in seen or seen.add(u))]
-            else:
-                self.progress.emit(f"    Response: {resp.text[:200]}")
+            if resp.status_code != 200:
+                return result
+
+            data_attrs: set = set()
+            event_attrs: set = set()
+
+            for widget in resp.json().get("widgets", []):
+                # Attribute list lives inside each widget
+                for attr_cfg in widget.get("attributes", []):
+                    svc_type = attr_cfg.get("serviceType", {}).get("type", "")
+                    attr_name = attr_cfg.get("attribute", {}).get("name", "")
+                    if not attr_name or not svc_type:
+                        continue
+                    if "sensor-data" in svc_type:
+                        result["data_type"] = svc_type
+                        data_attrs.add(attr_name)
+                    elif "sensor-event" in svc_type:
+                        result["event_type"] = svc_type
+                        event_attrs.add(attr_name)
+
+            result["data_attrs"]  = sorted(data_attrs)
+            result["event_attrs"] = sorted(event_attrs)
+
         except Exception as e:
             self.progress.emit(f"    Dashboard lookup error: {e}")
-        return []
+        return result
 
     # ---- extract metadata from asset response ----
     @staticmethod
@@ -629,50 +627,68 @@ class DownloadWorker(QObject):
 
                     # Step 3: Download telemetry for each module
                     #
-                    # The telemetry API key is a UUID stored in the module's externalId.
-                    # Multi-module cases (Left / Center/Right) always have UUID externalIds.
-                    # Single "Main" module cases often have the serialNumber instead of a
-                    # UUID — in that case we look up the dashboard config to find the real
-                    # UUID that the portal uses.
-                    asset_ext_id = asset.get("externalId", "")
-                    asset_serial  = asset.get("serialNumber", case_id)
-                    _dash_uuids_cache: Optional[List[str]] = None  # fetched lazily once
+                    # Standard Microblock assets have UUID externalIds on their modules
+                    # and use service types  Microblock-sensor-data / -sensor-event.
+                    #
+                    # Older Carel-iJ assets have the serialNumber as their module
+                    # externalId (no UUID) and use different service types:
+                    #   Microblock-Cases-sensor-data / Microblock-Cases-sensor-event
+                    # with different attribute names.  We detect this by checking
+                    # whether the externalId is a UUID; if not, we fetch the dashboard
+                    # config which tells us the exact service type and attribute names.
+                    _dash_attrs_cache: Optional[dict] = None  # fetched once per case
 
                     for m_idx, module in enumerate(modules, 1):
                         mod_name   = module.get("name", f"Module_{m_idx}")
                         mod_ext_id = module.get("externalId") or ""
 
-                        # Start with the module's own externalId
-                        candidates = []
-                        for cid in [mod_ext_id, asset_ext_id, asset_serial, case_id]:
-                            if cid and cid not in candidates:
-                                candidates.append(cid)
-
-                        # If the lead candidate is NOT a UUID, the telemetry store won't
-                        # match it. Look up the dashboard config to find the real UUIDs.
-                        if not self._is_uuid(candidates[0] if candidates else ""):
-                            if _dash_uuids_cache is None:
+                        # Decide which attribute set and service types to use
+                        if self._is_uuid(mod_ext_id):
+                            # Standard Microblock: use global CASE_ATTRS as-is
+                            ext_id   = mod_ext_id
+                            use_attrs = CASE_ATTRS
+                        else:
+                            # Non-UUID externalId: look up dashboard for correct
+                            # service type + attribute names (fetched once per case)
+                            ext_id = mod_ext_id or asset.get("serialNumber", case_id)
+                            if _dash_attrs_cache is None:
                                 self.progress.emit(
-                                    f"    Looking up dashboard config for UUIDs…")
-                                _dash_uuids_cache = self._get_dashboard_uuids(asset_id)
-                            # Prepend dashboard UUIDs — they're the most likely match
-                            for uid in reversed(_dash_uuids_cache):
-                                if uid not in candidates:
-                                    candidates.insert(0, uid)
+                                    "    Fetching dashboard config "
+                                    "(non-standard device)…")
+                                _dash_attrs_cache = self._get_dashboard_attrs(asset_id)
+                                dt = _dash_attrs_cache.get("data_type", "?")
+                                da = _dash_attrs_cache.get("data_attrs", [])
+                                et = _dash_attrs_cache.get("event_type", "?")
+                                ea = _dash_attrs_cache.get("event_attrs", [])
+                                self.progress.emit(
+                                    f"    data  ({dt}): {da}")
+                                self.progress.emit(
+                                    f"    event ({et}): {ea}")
 
-                        # Debug: show full module dict when externalId is not a UUID
-                        if not self._is_uuid(mod_ext_id):
-                            self.progress.emit(
-                                f"    Module fields: {json.dumps(module)}"
-                            )
+                            # Build attrs from dashboard info if available
+                            dash = _dash_attrs_cache
+                            if dash.get("data_type") and dash.get("data_attrs"):
+                                use_attrs = [
+                                    {"attribute": a,
+                                     "serviceType": dash["data_type"]}
+                                    for a in dash["data_attrs"]
+                                ] + [
+                                    {"attribute": a,
+                                     "serviceType": dash["event_type"]}
+                                    for a in dash["event_attrs"]
+                                    if dash.get("event_type")
+                                ]
+                            else:
+                                # Dashboard gave nothing — fall back to CASE_ATTRS
+                                use_attrs = CASE_ATTRS
 
                         self.progress.emit(
                             f"  Module {m_idx}/{len(modules)}: {mod_name}"
-                            f"  [id: {candidates[0]}]")
+                            f"  [id: {ext_id}]")
 
-                        # Group attrs by service type
+                        # Group attrs by service type and query each group
                         by_service: Dict[str, list] = {}
-                        for attr_def in CASE_ATTRS:
+                        for attr_def in use_attrs:
                             st = attr_def["serviceType"]
                             by_service.setdefault(st, []).append(attr_def)
 
@@ -685,26 +701,17 @@ class DownloadWorker(QObject):
                                 f"    Querying {svc_label} "
                                 f"({len(attrs)} attributes)...")
 
-                            df = pd.DataFrame()
-                            used_id = candidates[0]
-                            for cid in candidates:
-                                df = self._query_telemetry(
-                                    cid, svc_type, attrs, start_dt, end_dt)
-                                if len(df) > 0:
-                                    used_id = cid
-                                    break
+                            df = self._query_telemetry(
+                                ext_id, svc_type, attrs, start_dt, end_dt)
 
                             if len(df) > 0:
                                 sheet = f"{mod_name}_{svc_label}"
                                 all_sheets[sheet] = df
-                                note = (f"  (via {used_id})"
-                                        if used_id != candidates[0] else "")
                                 self.progress.emit(
-                                    f"    OK  {len(df)} rows{note}")
+                                    f"    OK  {len(df)} rows")
                             else:
                                 self.progress.emit(
-                                    f"    --  No {svc_label} data"
-                                    f"  [tried: {', '.join(candidates)}]")
+                                    f"    --  No {svc_label} data")
 
                     # Step 4: Download store ambient
                     if meta["store"]:
